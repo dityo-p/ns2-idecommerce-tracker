@@ -23,7 +23,10 @@ class Config:
 
     # ── Output paths ──────────────────────────────────────────
     # These files are written after every fetch and served by GitHub Pages
-    data_dir:      str = field(default_factory=lambda: os.getenv("DATA_DIR", "dashboard/data"))
+    data_dir:      str = field(default_factory=lambda: os.getenv(
+        "DATA_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dashboard", "data")
+    ))
     prices_json:   str = "prices.json"      # latest snapshot → dashboard live table
     history_json:  str = "history.json"     # full history log → chart + history tab
     meta_json:     str = "meta.json"        # last-updated, source, stats
