@@ -1,37 +1,37 @@
 {
-  "updated_at": "2026-05-28T11:23:57.308846+00:00",
-  "source": "demo",
-  "is_demo": true,
+  "updated_at": "2026-05-28T23:57:17.768431+00:00",
+  "source": "serpapi",
+  "is_demo": false,
   "stats": {
-    "min": 6299000,
-    "max": 6799000,
-    "avg": 6465833,
-    "count": 6
+    "min": 1009000,
+    "max": 8999000,
+    "avg": 4542400,
+    "count": 5
   },
   "by_platform": {
     "Tokopedia": {
       "count": 2,
-      "min": 6299000,
-      "max": 6399000,
-      "avg": 6349000
+      "min": 1009000,
+      "max": 1055000,
+      "avg": 1032000
     },
     "Shopee": {
       "count": 2,
-      "min": 6350000,
-      "max": 6799000,
-      "avg": 6574500
+      "min": 4749000,
+      "max": 6900000,
+      "avg": 5824500
     },
     "BliBli": {
-      "count": 2,
-      "min": 6449000,
-      "max": 6499000,
-      "avg": 6474000
+      "count": 1,
+      "min": 8999000,
+      "max": 8999000,
+      "avg": 8999000
     }
   },
-  "history_count": 0,
+  "history_count": 15,
   "recent_logs": [
     {
-      "started_at": "2026-05-28T11:23:57.284583",
+      "started_at": "2026-05-28T23:57:17.535818",
       "finished_at": null,
       "source": null,
       "queries_fired": 0,
@@ -41,6 +41,30 @@
       "success": false,
       "error": null,
       "duration_s": null
+    },
+    {
+      "started_at": "2026-05-28T23:02:04.362273",
+      "finished_at": "2026-05-28T23:02:21.293294",
+      "source": "serpapi",
+      "queries_fired": 4,
+      "listings_found": 5,
+      "new": 0,
+      "updated": 5,
+      "success": true,
+      "error": null,
+      "duration_s": 16.931021
+    },
+    {
+      "started_at": "2026-05-28T13:23:53.629372",
+      "finished_at": "2026-05-28T13:24:05.626324",
+      "source": "serpapi",
+      "queries_fired": 4,
+      "listings_found": 5,
+      "new": 5,
+      "updated": 0,
+      "success": true,
+      "error": null,
+      "duration_s": 11.996952
     }
   ]
 }
