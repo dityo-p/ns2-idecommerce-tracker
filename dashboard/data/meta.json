@@ -1,0 +1,46 @@
+{
+  "updated_at": "2026-05-28T11:23:57.308846+00:00",
+  "source": "demo",
+  "is_demo": true,
+  "stats": {
+    "min": 6299000,
+    "max": 6799000,
+    "avg": 6465833,
+    "count": 6
+  },
+  "by_platform": {
+    "Tokopedia": {
+      "count": 2,
+      "min": 6299000,
+      "max": 6399000,
+      "avg": 6349000
+    },
+    "Shopee": {
+      "count": 2,
+      "min": 6350000,
+      "max": 6799000,
+      "avg": 6574500
+    },
+    "BliBli": {
+      "count": 2,
+      "min": 6449000,
+      "max": 6499000,
+      "avg": 6474000
+    }
+  },
+  "history_count": 0,
+  "recent_logs": [
+    {
+      "started_at": "2026-05-28T11:23:57.284583",
+      "finished_at": null,
+      "source": null,
+      "queries_fired": 0,
+      "listings_found": 0,
+      "new": 0,
+      "updated": 0,
+      "success": false,
+      "error": null,
+      "duration_s": null
+    }
+  ]
+}
