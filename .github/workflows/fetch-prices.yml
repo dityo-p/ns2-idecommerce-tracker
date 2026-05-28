@@ -1,11 +1,9 @@
 name: Fetch prices
 
 on:
-  # Run automatically every 6 hours
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"   # every 6 hours UTC
 
-  # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
     inputs:
       mode:
@@ -14,24 +12,22 @@ on:
         default: "fetch"
         type: choice
         options:
-          - fetch          # full fetch → store → export
-          - export-only    # re-export DB without fetching
-          - status         # print status and exit (no file changes)
+          - fetch
+          - export-only
+          - status
 
 jobs:
   fetch-prices:
     runs-on: ubuntu-latest
     permissions:
-      contents: write    # needed to git commit the updated JSON files
+      contents: write
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # ── 2. Python setup ────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -42,9 +38,34 @@ jobs:
       - name: Install dependencies
         run: pip install -r engine/requirements.txt
 
-      # ── 3. Restore SQLite database from cache ──────────────────────────────
-      # This lets history accumulate across workflow runs.
-      # Cache key rotates weekly so storage doesn't grow unbounded.
+      # ── Diagnose secrets before running ──────────────────────────────────────
+      # This step prints clearly whether each secret is set or empty.
+      # It never prints the actual key value.
+      - name: Check secrets
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
+        run: |
+          echo "=== Secret check ==="
+          if [ -n "$SERPAPI_KEY" ]; then
+            echo "✅ SERPAPI_KEY is set (length: ${#SERPAPI_KEY})"
+          else
+            echo "❌ SERPAPI_KEY is NOT set"
+          fi
+          if [ -n "$SERPER_KEY" ]; then
+            echo "✅ SERPER_KEY is set (length: ${#SERPER_KEY})"
+          else
+            echo "❌ SERPER_KEY is NOT set"
+          fi
+          if [ -z "$SERPAPI_KEY" ] && [ -z "$SERPER_KEY" ]; then
+            echo ""
+            echo "⚠️  WARNING: No API keys found — engine will use demo data."
+            echo "   Add SERPAPI_KEY or SERPER_KEY in:"
+            echo "   Settings → Secrets and variables → Actions → New repository secret"
+          fi
+          echo "===================="
+
+      # ── Restore SQLite DB from cache ──────────────────────────────────────────
       - name: Restore DB cache
         uses: actions/cache@v4
         with:
@@ -53,15 +74,28 @@ jobs:
           restore-keys: |
             ns2-db-
 
-      # ── 4. Run engine ──────────────────────────────────────────────────────
+      # ── Run diagnostics first (always visible in Actions log) ───────────────
+      - name: Diagnose configuration
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
+          DATA_DIR:    ${{ github.workspace }}/dashboard/data
+        working-directory: engine
+        run: python main.py --diagnose
+
+      # ── Run engine ────────────────────────────────────────────────────────────
+      # DATA_DIR is set as an absolute path relative to GITHUB_WORKSPACE
+      # so it is correct regardless of working-directory.
       - name: Run price engine
         env:
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
           SERPER_KEY:  ${{ secrets.SERPER_KEY }}
-          DATA_DIR:    dashboard/data
+          DATA_DIR:    ${{ github.workspace }}/dashboard/data
         working-directory: engine
         run: |
           MODE="${{ github.event.inputs.mode || 'fetch' }}"
+          echo "Running in mode: $MODE"
+          echo "DATA_DIR=$DATA_DIR"
           if [ "$MODE" = "export-only" ]; then
             python main.py --export-only
           elif [ "$MODE" = "status" ]; then
@@ -70,7 +104,20 @@ jobs:
             python main.py
           fi
 
-      # ── 5. Upload engine log as artifact ───────────────────────────────────
+      # ── Show what was written ─────────────────────────────────────────────────
+      - name: Show exported data
+        if: github.event.inputs.mode != 'status'
+        run: |
+          echo "=== dashboard/data contents ==="
+          ls -lh dashboard/data/
+          echo ""
+          echo "=== prices.json (first 30 lines) ==="
+          head -30 dashboard/data/prices.json || echo "(file not found)"
+          echo ""
+          echo "=== meta.json ==="
+          cat dashboard/data/meta.json || echo "(file not found)"
+
+      # ── Upload engine log ─────────────────────────────────────────────────────
       - name: Upload engine log
         if: always()
         uses: actions/upload-artifact@v4
@@ -79,8 +126,7 @@ jobs:
           path: engine/engine.log
           retention-days: 14
 
-      # ── 6. Commit updated JSON files ───────────────────────────────────────
-      # Only commits if prices.json / history.json / meta.json actually changed.
+      # ── Commit updated JSON files ─────────────────────────────────────────────
       - name: Commit data files
         if: github.event.inputs.mode != 'status'
         run: |
@@ -89,10 +135,10 @@ jobs:
           git add dashboard/data/prices.json \
                   dashboard/data/history.json \
                   dashboard/data/meta.json    || true
-          # Only commit if there are staged changes
           if git diff --cached --quiet; then
             echo "No data changes — skipping commit."
           else
             git commit -m "chore: update price data [skip ci]"
             git push
+            echo "✅ Data committed and pushed."
           fi
