@@ -44,9 +44,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: engine/ns2_tracker.db
-          key: ns2-db-${{ github.run_id }}
+          # v2 prefix busts the old cache that had the stale sellers schema.
+          # Increment this prefix whenever a breaking DB schema change is made.
+          key: ns2-db-v2-${{ github.run_id }}
           restore-keys: |
-            ns2-db-
+            ns2-db-v2-
 
       # ── Diagnostics ───────────────────────────────────────────────────────────
       - name: Diagnose configuration
