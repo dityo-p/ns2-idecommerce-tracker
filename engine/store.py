@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from models import Seller, Listing, PriceHistory, FetchLog, get_engine, get_session
-from config import Config, OFFICIAL_SELLERS
+from config import Config, TRACKED_LISTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +24,17 @@ logger = logging.getLogger(__name__)
 # ── Seed ──────────────────────────────────────────────────────────────────────
 
 def seed_sellers(session: Session) -> None:
-    """Insert official sellers if they don't exist yet."""
-    for s in OFFICIAL_SELLERS:
-        exists = session.query(Seller).filter_by(name=s["name"]).first()
+    """Insert tracked listing sellers if they don't exist yet."""
+    from config import TRACKED_LISTINGS as _TL
+    seen = set()
+    for s in _TL:
+        key = (s["seller"], s["platform"])
+        if key in seen:
+            continue
+        seen.add(key)
+        exists = session.query(Seller).filter_by(name=s["seller"], platform=s["platform"]).first()
         if not exists:
-            session.add(Seller(name=s["name"], platform=s["platform"], base_url=s.get("url")))
+            session.add(Seller(name=s["seller"], platform=s["platform"], base_url=s.get("url", "")))
     session.commit()
     logger.info("Sellers table seeded.")
 
