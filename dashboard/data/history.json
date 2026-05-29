@@ -1,7 +1,19 @@
 {
-  "updated_at": "2026-05-28T23:57:17.768431+00:00",
-  "total": 15,
+  "updated_at": "2026-05-29T00:19:44.462165+00:00",
+  "total": 16,
   "records": [
+    {
+      "ts": "2026-05-29T00:19:44.456346",
+      "seller": "Supersonicgamestore",
+      "platform": "Shopee",
+      "product": "Nintendo Switch 2",
+      "variant": "Standard",
+      "price": 9659000,
+      "prev_price": null,
+      "stock": "in-stock",
+      "url": "https://shopee.co.id/supersonicgamestore",
+      "source": "serpapi"
+    },
     {
       "ts": "2026-05-28T23:57:17.761220",
       "seller": "Official Store",

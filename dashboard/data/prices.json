@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-05-28T23:57:17.768431+00:00",
+  "updated_at": "2026-05-29T00:19:44.462165+00:00",
   "source": "serpapi",
   "is_demo": false,
   "listings": [
@@ -61,6 +61,18 @@
       "stock": "in-stock",
       "url": "https://www.blibli.com/promosi/nintendo-switch-2",
       "fetched_at": "2026-05-28T23:57:17.759959",
+      "source": "serpapi"
+    },
+    {
+      "seller": "Supersonicgamestore",
+      "platform": "Shopee",
+      "product": "Nintendo Switch 2",
+      "variant": "Standard",
+      "price": 9659000,
+      "prev_price": null,
+      "stock": "in-stock",
+      "url": "https://shopee.co.id/supersonicgamestore",
+      "fetched_at": "2026-05-29T00:19:44.453829",
       "source": "serpapi"
     }
   ]

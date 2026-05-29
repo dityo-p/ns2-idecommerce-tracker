@@ -1,12 +1,12 @@
 {
-  "updated_at": "2026-05-28T23:57:17.768431+00:00",
+  "updated_at": "2026-05-29T00:19:44.462165+00:00",
   "source": "serpapi",
   "is_demo": false,
   "stats": {
     "min": 1009000,
-    "max": 8999000,
-    "avg": 4542400,
-    "count": 5
+    "max": 9659000,
+    "avg": 5395167,
+    "count": 6
   },
   "by_platform": {
     "Tokopedia": {
@@ -16,10 +16,10 @@
       "avg": 1032000
     },
     "Shopee": {
-      "count": 2,
+      "count": 3,
       "min": 4749000,
-      "max": 6900000,
-      "avg": 5824500
+      "max": 9659000,
+      "avg": 7102667
     },
     "BliBli": {
       "count": 1,
@@ -28,10 +28,10 @@
       "avg": 8999000
     }
   },
-  "history_count": 15,
+  "history_count": 16,
   "recent_logs": [
     {
-      "started_at": "2026-05-28T23:57:17.535818",
+      "started_at": "2026-05-29T00:16:50.742959",
       "finished_at": null,
       "source": null,
       "queries_fired": 0,
@@ -41,6 +41,18 @@
       "success": false,
       "error": null,
       "duration_s": null
+    },
+    {
+      "started_at": "2026-05-28T23:57:17.535818",
+      "finished_at": "2026-05-28T23:57:17.769457",
+      "source": "serpapi",
+      "queries_fired": 4,
+      "listings_found": 5,
+      "new": 0,
+      "updated": 5,
+      "success": true,
+      "error": null,
+      "duration_s": 0.233639
     },
     {
       "started_at": "2026-05-28T23:02:04.362273",
