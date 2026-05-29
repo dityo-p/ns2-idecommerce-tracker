@@ -1,19 +1,31 @@
 """
-Price fetcher — fires one targeted search query per official seller,
-then strictly validates that each result matches both the expected
-seller name AND platform before accepting it.
+Price fetcher — uses a three-tier query strategy per seller to maximise
+the chance of finding real results from these specific stores.
 
-No result is ever accepted with an unknown seller name. The "Official Store"
-fallback from the old version has been removed entirely.
+Why three tiers?
+  Tier 1 — inurl:store_slug + site:platform
+    Most targeted. Works when the store has a product page indexed by Google.
+    e.g. 'Nintendo Switch 2 inurl:psegameshop site:tokopedia.com'
 
-Architecture:
-    fetch_all()
-        └── for each seller in OFFICIAL_SELLERS:
-                _fetch_query(seller-specific query)
-                    ├── _fetch_serpapi()   primary
-                    └── _fetch_serper()    fallback
-                _parse_items(items, seller_config)
-                    └── strict seller+platform guard — DROP if no match
+  Tier 2 — store_slug unquoted + site:platform  (no inurl)
+    Broader — catches cases where the slug appears in snippet but not URL.
+    e.g. 'Nintendo Switch 2 psegameshop site:tokopedia.com'
+
+  Tier 3 — store_slug + platform name only  (no site: operator)
+    Widest net. Catches aggregator pages, review sites, and cached results
+    that mention both the store slug and the platform.
+    e.g. 'Nintendo Switch 2 psegameshop tokopedia harga'
+
+Each result is strictly validated:
+  - Must mention Nintendo Switch 2
+  - Result URL must come from the correct platform domain  (tiers 1 & 2)
+    OR the snippet must mention the platform  (tier 3)
+  - The store slug (not display name) must appear in the URL or snippet
+  - Must contain a parseable IDR price in range [1M–20M]
+
+A result that passes all four checks is accepted and the remaining tiers
+for that seller are skipped. If all three tiers fail, the seller is logged
+as not found — the existing DB row is preserved (not overwritten with blank).
 """
 
 import re
@@ -28,7 +40,7 @@ from config import Config, OFFICIAL_SELLERS, DEMO_LISTINGS
 logger = logging.getLogger(__name__)
 
 
-# ── Platform domain map ───────────────────────────────────────────────────────
+# ── Platform map ──────────────────────────────────────────────────────────────
 
 PLATFORM_DOMAINS = {
     "tokopedia.com": "Tokopedia",
@@ -36,53 +48,57 @@ PLATFORM_DOMAINS = {
     "blibli.com":    "BliBli",
 }
 
+PLATFORM_DOMAIN_MAP = {v: k for k, v in PLATFORM_DOMAINS.items()}   # reverse
 
-# ── Per-seller search query builder ──────────────────────────────────────────
 
-def _build_query(seller: dict) -> str:
+# ── Query builder ─────────────────────────────────────────────────────────────
+
+def _queries_for_seller(seller: dict) -> list[dict]:
     """
-    Build a precise Google query that targets one seller on one platform.
-
-    Examples:
-      'Nintendo Switch 2 "PS Enterprise" site:tokopedia.com'
-      'Nintendo Switch 2 "Drakuli" site:shopee.co.id'
-      'Nintendo Switch 2 "Gamestation" site:blibli.com'
-
-    Quoting the seller name forces Google to require the exact string,
-    eliminating results from unrelated stores.
+    Return three queries for one seller, from most-targeted to broadest.
+    Each dict has keys: q (query string), tier (int), require_platform_in_url (bool).
     """
-    platform_domains = {
-        "Tokopedia": "tokopedia.com",
-        "Shopee":    "shopee.co.id",
-        "BliBli":    "blibli.com",
-    }
-    domain = platform_domains.get(seller["platform"], "")
-    site_clause = f"site:{domain}" if domain else ""
-    return f'Nintendo Switch 2 "{seller["name"]}" {site_clause}'.strip()
+    slug     = seller["store_slug"]
+    platform = seller["platform"]
+    domain   = PLATFORM_DOMAIN_MAP.get(platform, "")
+
+    return [
+        {
+            "tier": 1,
+            "q": f"Nintendo Switch 2 inurl:{slug} site:{domain}",
+            "require_platform_url": True,
+        },
+        {
+            "tier": 2,
+            "q": f"Nintendo Switch 2 {slug} site:{domain}",
+            "require_platform_url": True,
+        },
+        {
+            "tier": 3,
+            "q": f"Nintendo Switch 2 {slug} {platform} harga",
+            "require_platform_url": False,   # only require platform in snippet
+        },
+    ]
 
 
-# ── Result parsers ────────────────────────────────────────────────────────────
+# ── Validation helpers ────────────────────────────────────────────────────────
 
-def _detect_platform(url: str, snippet: str = "") -> Optional[str]:
-    combined = (url + " " + snippet).lower()
+def _detect_platform_from_url(url: str) -> Optional[str]:
+    url_lower = url.lower()
     for domain, platform in PLATFORM_DOMAINS.items():
-        if domain in combined:
+        if domain in url_lower:
             return platform
     return None
 
 
-def _seller_mentioned(title: str, snippet: str, seller_name: str) -> bool:
-    """Return True only if the seller name appears literally in title or snippet."""
-    text = (title + " " + snippet).lower()
-    return seller_name.lower() in text
+def _slug_in_result(url: str, snippet: str, slug: str) -> bool:
+    """Return True if the store slug appears in the URL or snippet."""
+    combined = (url + " " + snippet).lower()
+    return slug.lower() in combined
 
 
 def _extract_price(text: str, min_idr: int, max_idr: int) -> Optional[int]:
-    """
-    Extract an IDR price from mixed text.
-    Handles: Rp 6.299.000 / Rp6299000 / 6,299,000 / 6.299.000
-    """
-    cleaned = re.sub(r"[Rr][Pp]\.?\s*", "", text)
+    cleaned    = re.sub(r"[Rr][Pp]\.?\s*", "", text)
     candidates = re.findall(r"\d{1,2}[.,]\d{3}(?:[.,]\d{3})+|\d{6,10}", cleaned)
     for raw in candidates:
         numeric = int(re.sub(r"[.,]", "", raw))
@@ -110,60 +126,61 @@ def _classify_variant(text: str) -> str:
 def _parse_items_for_seller(
     items: list,
     seller: dict,
+    require_platform_url: bool,
     cfg: Config,
 ) -> Optional[dict]:
     """
-    Search `items` for a result that:
-      1. Mentions Nintendo Switch 2
-      2. Mentions the exact seller name
-      3. Comes from the seller's expected platform domain
-      4. Contains a valid IDR price
-
-    Returns the best matching listing dict, or None if nothing qualifies.
-    The first qualifying result wins (results are already ranked by Google).
+    Scan items for one result that passes all four validation checks.
+    Returns the first match, or None.
     """
     expected_platform = seller["platform"]
-    seller_name       = seller["name"]
+    slug              = seller["store_slug"]
     fallback_url      = seller["url"]
 
     for item in items:
         title   = item.get("title")   or ""
         snippet = item.get("snippet") or item.get("description") or ""
         link    = item.get("link")    or item.get("url") or ""
-        full    = title + " " + snippet
+        full    = title + " " + snippet + " " + link
 
-        # Must mention Switch 2
-        if not re.search(r"switch\s*2|nintendo\s+switch\s+2", full, re.I):
-            logger.debug(f"  skip (no Switch 2 mention): {title[:60]}")
+        # 1. Must mention Switch 2
+        if not re.search(r"nintendo\s*switch\s*2|switch\s*2|ns\s*2|ns2", full, re.I):
+            logger.debug(f"    skip (no Switch 2): {title[:55]}")
             continue
 
-        # Must come from the right platform domain
-        detected_platform = _detect_platform(link, snippet)
-        if detected_platform and detected_platform != expected_platform:
-            logger.debug(f"  skip (wrong platform {detected_platform}≠{expected_platform}): {link[:60]}")
+        # 2. Platform check
+        url_platform = _detect_platform_from_url(link)
+        if require_platform_url:
+            if url_platform != expected_platform:
+                logger.debug(f"    skip (platform {url_platform}≠{expected_platform}): {link[:55]}")
+                continue
+        else:
+            # Tier 3: platform must appear somewhere in the full text
+            if expected_platform.lower() not in full.lower():
+                logger.debug(f"    skip (platform not in text): {title[:55]}")
+                continue
+
+        # 3. Store slug must appear in URL or snippet
+        if not _slug_in_result(link, snippet, slug):
+            logger.debug(f"    skip (slug '{slug}' not found): {link[:55]}")
             continue
 
-        # Seller name must appear literally in the result
-        if not _seller_mentioned(title, snippet, seller_name):
-            logger.debug(f"  skip (seller '{seller_name}' not mentioned): {title[:60]}")
-            continue
-
-        # Must have a parseable IDR price
+        # 4. Must have a valid IDR price
         price = _extract_price(full, cfg.min_price_idr, cfg.max_price_idr)
         if not price:
-            logger.debug(f"  skip (no price found): {title[:60]}")
+            logger.debug(f"    skip (no price): {title[:55]}")
             continue
 
         variant = _classify_variant(full)
         stock   = _classify_stock(snippet)
-        url     = link if link else fallback_url
+        url     = link if (link and expected_platform.lower() in link.lower()) else fallback_url
 
         logger.info(
-            f"  ✓ matched: seller={seller_name}  platform={expected_platform}"
-            f"  price=Rp{price:,}  variant={variant}  stock={stock}"
+            f"    ✓ {seller['name']} @ {expected_platform}  "
+            f"Rp{price:,}  {variant}  {stock}"
         )
         return {
-            "seller":   seller_name,
+            "seller":   seller["name"],
             "platform": expected_platform,
             "product":  "Nintendo Switch 2",
             "variant":  variant,
@@ -172,7 +189,6 @@ def _parse_items_for_seller(
             "url":      url,
         }
 
-    logger.warning(f"  no qualifying result for {seller_name} @ {expected_platform}")
     return None
 
 
@@ -203,7 +219,6 @@ def _fetch_serpapi(query: str, cfg: Config) -> list:
         if "error" in data:
             raise ValueError(f"SerpApi error: {data['error']}")
         return data.get("organic_results") or []
-
     return _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
 
 
@@ -217,26 +232,23 @@ def _fetch_serper(query: str, cfg: Config) -> list:
         )
         resp.raise_for_status()
         return resp.json().get("organic") or []
-
     return _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
 
 
 def _fetch_query(query: str, cfg: Config) -> tuple[list, str]:
-    """Try SerpApi first, fall back to Serper.dev. Returns (items, source_name)."""
+    """Try SerpApi, fall back to Serper. Returns (items, source_name)."""
     if cfg.has_serpapi():
         try:
             items = _fetch_serpapi(query, cfg)
-            logger.info(f"  SerpApi: {len(items)} results")
+            logger.info(f"  SerpApi → {len(items)} results")
             return items, "serpapi"
         except Exception as exc:
             logger.warning(f"  SerpApi failed ({exc}), trying Serper…")
-
     if cfg.has_serper():
         items = _fetch_serper(query, cfg)
-        logger.info(f"  Serper: {len(items)} results")
+        logger.info(f"  Serper  → {len(items)} results")
         return items, "serper"
-
-    raise RuntimeError("No API keys configured. Set SERPAPI_KEY or SERPER_KEY.")
+    raise RuntimeError("No API keys configured.")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -253,11 +265,9 @@ class FetchResult:
 
 def fetch_all(cfg: Config) -> FetchResult:
     """
-    Fire one targeted query per seller in OFFICIAL_SELLERS.
-    Each result is strictly validated against the expected seller name
-    and platform — random stores are never accepted.
-
-    Falls back to DEMO_LISTINGS only when no API keys are configured.
+    For each seller in OFFICIAL_SELLERS, try up to three query tiers until
+    a valid result is found. Strictly validates seller slug + platform on
+    every result — random stores are never accepted.
     """
     result = FetchResult()
 
@@ -269,26 +279,47 @@ def fetch_all(cfg: Config) -> FetchResult:
         result.is_demo  = True
         return result
 
-    listings:     list[dict] = []
-    source_used:  str        = "unknown"
+    listings:    list[dict] = []
+    source_used: str        = "unknown"
 
     for seller in OFFICIAL_SELLERS:
-        query = _build_query(seller)
-        result.queries_fired += 1
-        logger.info(f"Querying: {seller['name']} @ {seller['platform']}  →  {query}")
+        logger.info(f"── {seller['name']} @ {seller['platform']} (slug: {seller['store_slug']}) ──")
+        found = False
 
-        try:
-            items, source = _fetch_query(query, cfg)
-            source_used   = source
-            listing       = _parse_items_for_seller(items, seller, cfg)
-            if listing:
-                listings.append(listing)
-        except Exception as exc:
-            logger.error(f"  query failed for {seller['name']}: {exc}")
+        for q_cfg in _queries_for_seller(seller):
+            tier  = q_cfg["tier"]
+            query = q_cfg["q"]
+            logger.info(f"  Tier {tier}: {query}")
+            result.queries_fired += 1
+
+            try:
+                items, source = _fetch_query(query, cfg)
+                source_used   = source
+
+                if not items:
+                    logger.info(f"  Tier {tier}: 0 results — trying next tier")
+                    continue
+
+                listing = _parse_items_for_seller(
+                    items, seller, q_cfg["require_platform_url"], cfg
+                )
+
+                if listing:
+                    listings.append(listing)
+                    found = True
+                    break   # stop trying tiers for this seller
+                else:
+                    logger.info(f"  Tier {tier}: results returned but none passed validation")
+
+            except Exception as exc:
+                logger.error(f"  Tier {tier} query failed: {exc}")
+
+        if not found:
+            logger.warning(f"  ✗ {seller['name']}: not found across all tiers — DB row preserved")
 
     logger.info(
-        f"Fetch complete — {len(listings)}/{len(OFFICIAL_SELLERS)} sellers found"
-        f"  source={source_used}"
+        f"\nFetch complete — {len(listings)}/{len(OFFICIAL_SELLERS)} sellers matched"
+        f"  source={source_used}  queries_fired={result.queries_fired}"
     )
 
     if listings:
@@ -296,11 +327,10 @@ def fetch_all(cfg: Config) -> FetchResult:
         result.source   = source_used
         result.success  = True
     else:
-        # All queries returned zero valid results — don't pollute DB with random data
-        logger.error("Zero valid listings found. Keeping existing DB data (no overwrite).")
+        logger.error("Zero valid listings found. DB not overwritten.")
         result.listings = []
         result.source   = source_used
         result.success  = False
-        result.error    = "No listings matched known sellers — DB not overwritten"
+        result.error    = "No listings matched known sellers across all query tiers"
 
     return result
