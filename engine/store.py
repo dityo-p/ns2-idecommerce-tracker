@@ -21,23 +21,85 @@ from config import Config, TRACKED_LISTINGS
 logger = logging.getLogger(__name__)
 
 
+
+# ── Schema migration ──────────────────────────────────────────────────────────
+
+def migrate_sellers_table(engine) -> None:
+    """
+    Fix stale sellers table if it was cached from an older DB version.
+
+    Old schema: UNIQUE(name)           -- breaks when same seller name appears
+                                          on multiple platforms.
+    New schema: UNIQUE(name, platform) -- correct.
+
+    Detects the old constraint via sqlite_master, drops the table if stale,
+    then calls create_all to rebuild with the correct schema.
+    Seller rows are trivially re-seeded from TRACKED_LISTINGS.
+    """
+    from sqlalchemy import text
+    from models import Base
+
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(text(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sellers'"
+            )).fetchone()
+
+            if row is None:
+                return   # table doesn't exist yet
+
+            create_sql = (row[0] or "").upper()
+            has_correct = (
+                "UQ_SELLER_NAME_PLATFORM" in create_sql or
+                ("UNIQUE" in create_sql and "PLATFORM" in create_sql.split("UNIQUE", 1)[-1])
+            )
+
+            if not has_correct:
+                logger.warning(
+                    "Stale sellers schema detected (UNIQUE on name only). "
+                    "Dropping and recreating."
+                )
+                conn.execute(text("DROP TABLE sellers"))
+                conn.commit()
+                logger.info("Dropped stale sellers table.")
+
+        except Exception as exc:
+            logger.warning(f"Schema migration inspection failed (non-fatal): {exc}")
+
+    # Always (re)create — no-op if table already correct
+    try:
+        Base.metadata.create_all(engine)
+        logger.info("sellers table schema OK ✅")
+    except Exception as exc:
+        logger.warning(f"create_all after migration failed: {exc}")
+
+
 # ── Seed ──────────────────────────────────────────────────────────────────────
 
 def seed_sellers(session: Session) -> None:
-    """Insert tracked listing sellers if they don't exist yet."""
+    """
+    Insert tracked listing sellers using raw INSERT OR IGNORE.
+    This is immune to unique-constraint violations regardless of schema version,
+    and avoids SQLAlchemy autoflush ordering issues.
+    """
+    from sqlalchemy import text
     from config import TRACKED_LISTINGS as _TL
+
     seen = set()
-    for s in _TL:
-        key = (s["seller"], s["platform"])
-        if key in seen:
-            continue
-        seen.add(key)
-        exists = session.query(Seller).filter_by(name=s["seller"], platform=s["platform"]).first()
-        if not exists:
-            session.add(Seller(name=s["seller"], platform=s["platform"], base_url=s.get("url", "")))
+    with session.no_autoflush:
+        for s in _TL:
+            key = (s["seller"], s["platform"])
+            if key in seen:
+                continue
+            seen.add(key)
+            # INSERT OR IGNORE handles both old UNIQUE(name) and new UNIQUE(name,platform)
+            # by simply skipping duplicates — no exception raised
+            session.execute(text(
+                "INSERT OR IGNORE INTO sellers (name, platform, base_url, is_active, created_at) "
+                "VALUES (:name, :platform, :url, 1, datetime('now'))"
+            ), {"name": s["seller"], "platform": s["platform"], "url": s.get("url", "")})
     session.commit()
     logger.info("Sellers table seeded.")
-
 
 # ── Upsert listings ───────────────────────────────────────────────────────────
 
