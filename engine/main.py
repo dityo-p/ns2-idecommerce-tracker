@@ -68,20 +68,27 @@ def run_once(cfg: Config) -> bool:
 
     new_count = updated_count = 0
 
-    if result.listings:
-        # 2. Upsert latest listings
+    if result.listings and not result.is_demo:
+        # 2. Upsert latest listings — only when we have real validated results
         new_count, updated_count = upsert_listings(session, result.listings, result.source)
+        # 3. Append history
+        append_history(session, result.listings, result.source)
+    elif result.listings and result.is_demo:
+        # Demo mode: upsert so DB is non-empty, but don't log history
+        new_count, updated_count = upsert_listings(session, result.listings, result.source)
+    else:
+        # Zero live results — log warning but DO NOT wipe existing DB rows
+        logger.warning(
+            "Fetch returned 0 validated listings. "
+            "Existing DB data preserved — dashboard will show last known prices."
+        )
 
-        # 3. Append history (skip demo data — no point logging fake prices)
-        if not result.is_demo:
-            append_history(session, result.listings, result.source)
-
-    # 4. Read back from DB (ensures we serve committed, consistent data)
+    # 4. Read back from DB (serves committed, consistent data regardless of fetch outcome)
     db_listings = get_latest_listings(session)
     db_history  = get_history(session, limit=1000)
     db_logs     = get_fetch_logs(session, limit=10)
 
-    # 5. Write JSON files
+    # 5. Write JSON files (always export so dashboard stays fresh)
     export_all(
         listings   = db_listings,
         history    = db_history,
