@@ -61,7 +61,8 @@ def run_once(cfg: Config) -> bool:
     log = start_fetch_log(session)
     logger.info("=" * 60)
     logger.info(f"Fetch cycle started at {datetime.utcnow().isoformat()}Z")
-    logger.info(f"API keys — SerpApi: {'✓' if cfg.has_serpapi() else '✗'}  Serper: {'✓' if cfg.has_serper() else '✗'}")
+    logger.info(f"Tracking {len(__import__('config').TRACKED_LISTINGS)} listings across Tokopedia / Shopee / BliBli")
+    logger.info(f"Strategy: direct platform API (no search queries needed)")
 
     # 1. Fetch
     result = fetch_all(cfg)
@@ -155,6 +156,7 @@ def export_only(cfg: Config) -> None:
 
 
 def print_status(cfg: Config) -> None:
+    from config import TRACKED_LISTINGS
     engine  = get_engine(cfg.database_url)
     session = get_session(engine)
     logs    = get_fetch_logs(session, limit=10)
@@ -164,16 +166,18 @@ def print_status(cfg: Config) -> None:
     print(f"\n{'─'*62}")
     print(f"  NS2 Price Tracker — Status")
     print(f"  DB: {cfg.database_url}")
+    print(f"  Tracking {len(TRACKED_LISTINGS)} listings (direct URL)")
     print(f"{'─'*62}")
-    print(f"  Current listings ({len(listings)}):")
+    print(f"  Current listings in DB ({len(listings)}):")
     for l in listings:
-        print(f"    {l['seller']:<24} {l['platform']:<12} Rp {l['price']:>10,.0f}  {l['stock']}")
+        src = "[demo]" if l.get("source") == "demo" else ""
+        print(f"    {l['seller']:<24} {l['platform']:<12} Rp {l['price']:>10,.0f}  {l['stock']}  {src}")
     print(f"\n  Recent fetch logs:")
     for log in logs:
         status = "✓" if log["success"] else "✗"
         ts = (log["started_at"] or "")[:19]
         print(
-            f"    {status} {ts}  source={log['source'] or '?':<10}  "
+            f"    {status} {ts}  source={log['source'] or '?':<12}  "
             f"found={log['listings_found']}  "
             f"duration={log['duration_s'] or '?'}s"
         )
@@ -185,56 +189,37 @@ def print_status(cfg: Config) -> None:
 
 def diagnose(cfg: Config) -> None:
     """
-    Print a full diagnostic report — useful when the dashboard shows demo data.
-    Checks keys, data_dir, DB, and JSON file contents.
+    Print a full diagnostic report — shows tracked URLs, DB contents, and JSON file status.
     """
     import json, os
-    W = "\033[93m"  # yellow
-    G = "\033[92m"  # green
-    R = "\033[91m"  # red
-    B = "\033[94m"  # blue
-    E = "\033[0m"   # reset
+    from config import TRACKED_LISTINGS
 
-    print(f"\n{B}{'═'*60}")
+    W = "\033[93m"; G = "\033[92m"; R = "\033[91m"; B = "\033[94m"; E = "\033[0m"
+
+    print(f"\n{B}{'═'*62}")
     print(f"  NS2 Price Tracker — Diagnostics")
-    print(f"{'═'*60}{E}\n")
+    print(f"{'═'*62}{E}\n")
 
-    # 1. API Keys
-    print(f"{B}[1] API Keys{E}")
-    if cfg.serpapi_key:
-        masked = cfg.serpapi_key[:6] + "…" + cfg.serpapi_key[-4:]
-        print(f"  {G}✅ SERPAPI_KEY set{E}  ({masked})")
-    else:
-        print(f"  {R}❌ SERPAPI_KEY not set{E}")
-
-    if cfg.serper_key:
-        masked = cfg.serper_key[:6] + "…" + cfg.serper_key[-4:]
-        print(f"  {G}✅ SERPER_KEY set{E}  ({masked})")
-    else:
-        print(f"  {R}❌ SERPER_KEY not set{E}")
-
-    if not cfg.serpapi_key and not cfg.serper_key:
-        print(f"\n  {W}→ FIX: Add SERPAPI_KEY or SERPER_KEY as a GitHub Secret{E}")
-        print(f"  {W}  Settings → Secrets and variables → Actions → New repository secret{E}\n")
-    else:
-        print()
+    # 1. Tracked listings
+    print(f"{B}[1] Tracked listings ({len(TRACKED_LISTINGS)}){E}")
+    for entry in TRACKED_LISTINGS:
+        print(f"  {entry['seller']:<22} {entry['platform']:<12} {entry['url'][:60]}")
 
     # 2. Database
-    print(f"{B}[2] Database{E}")
+    print(f"\n{B}[2] Database{E}")
     print(f"  URL: {cfg.database_url}")
     db_path = cfg.database_url.replace("sqlite:///", "")
     if cfg.database_url.startswith("sqlite"):
         if os.path.exists(db_path):
             size = os.path.getsize(db_path)
-            print(f"  {G}✅ DB file exists{E}  ({size:,} bytes  →  {db_path})")
+            print(f"  {G}✅ DB file exists{E}  ({size:,} bytes  path={os.path.abspath(db_path)})")
         else:
-            print(f"  {W}⚠️  DB file not found yet — will be created on first run{E}")
-            print(f"  Path: {os.path.abspath(db_path)}")
+            print(f"  {W}⚠️  DB not found yet — created on first run{E}")
 
-    # 3. Output directory
+    # 3. Data output directory
     print(f"\n{B}[3] Data output directory{E}")
     data_dir = os.path.abspath(cfg.data_dir)
-    print(f"  Resolved path: {data_dir}")
+    print(f"  Resolved: {data_dir}")
     if os.path.isdir(data_dir):
         print(f"  {G}✅ Directory exists{E}")
         for fname in ["prices.json", "history.json", "meta.json"]:
@@ -242,20 +227,20 @@ def diagnose(cfg: Config) -> None:
             if os.path.exists(fpath):
                 size = os.path.getsize(fpath)
                 try:
-                    with open(fpath) as f:
-                        data = json.load(f)
-                    is_demo = data.get("is_demo", False)
-                    updated = data.get("updated_at", "unknown")
-                    count   = len(data.get("listings", data.get("records", [])))
-                    demo_flag = f"  {W}[DEMO]{E}" if is_demo else f"  {G}[LIVE]{E}"
-                    print(f"  {G}✅{E} {fname:<18} {size:>6,} bytes  updated={updated[:19]}{demo_flag}  items={count}")
+                    with open(fpath) as f2:
+                        data = json.load(f2)
+                    is_demo  = data.get("is_demo", False)
+                    updated  = data.get("updated_at", "unknown")
+                    items    = data.get("listings", data.get("records", []))
+                    demo_tag = f"  {W}[DEMO]{E}" if is_demo else f"  {G}[LIVE]{E}"
+                    print(f"  {G}✅{E} {fname:<18} {size:>7,} bytes  {updated[:19]}{demo_tag}  items={len(items)}")
                 except Exception as e:
-                    print(f"  {W}⚠️{E}  {fname:<18} {size:>6,} bytes  (parse error: {e})")
+                    print(f"  {W}⚠️{E}  {fname:<18} parse error: {e}")
             else:
-                print(f"  {R}❌{E} {fname} — not found")
+                print(f"  {R}❌{E} {fname} — not found (engine hasn\'t run yet)")
     else:
-        print(f"  {R}❌ Directory does not exist: {data_dir}{E}")
-        print(f"  {W}→ FIX: Create it with:  mkdir -p \"{data_dir}\"{E}")
+        print(f"  {R}❌ Directory missing: {data_dir}{E}")
+        print(f"  {W}→ Run:  mkdir -p \"{data_dir}\"{E}")
 
     # 4. Recent fetch logs
     print(f"\n{B}[4] Recent fetch history{E}")
@@ -263,61 +248,46 @@ def diagnose(cfg: Config) -> None:
         db_engine = get_engine(cfg.database_url)
         session   = get_session(db_engine)
         logs      = get_fetch_logs(session, limit=5)
-        listings  = get_latest_listings(session)
+        db_listings = get_latest_listings(session)
         session.close()
         if logs:
             for log in logs:
                 icon = G+"✅"+E if log["success"] else R+"❌"+E
                 ts   = (log["started_at"] or "")[:19]
-                print(f"  {icon} {ts}  source={log['source'] or '?':<10} found={log['listings_found']}  demo={'yes' if log['source']=='demo' else 'no'}")
-                if log["error"]:
-                    print(f"       error: {log['error']}")
+                print(f"  {icon} {ts}  source={log['source'] or '?':<14}  found={log['listings_found']}  duration={log['duration_s'] or '?'}s")
+                if log["error"]: print(f"       {R}error: {log['error']}{E}")
         else:
-            print(f"  {W}No fetch history yet — run  python main.py  first{E}")
-        if listings:
-            print(f"\n  Stored listings ({len(listings)}):")
-            for l in listings[:6]:
-                src_flag = f"  {W}[demo]{E}" if l.get("source") == "demo" else ""
-                print(f"    {l['seller']:<24} {l['platform']:<12} Rp {l['price']:>10,.0f}{src_flag}")
+            print(f"  {W}No history yet — run  python main.py  first{E}")
+        if db_listings:
+            print(f"\n  DB listings ({len(db_listings)}):")
+            for l in db_listings[:12]:
+                demo_tag = f"  {W}[demo]{E}" if l.get("source") == "demo" else ""
+                print(f"    {l['seller']:<22} {l['platform']:<12} Rp {l['price']:>10,.0f}  {l['stock']}{demo_tag}")
     except Exception as e:
         print(f"  {R}Could not read DB: {e}{E}")
 
-    # 5. Summary verdict
+    # 5. Verdict
     print(f"\n{B}[5] Verdict{E}")
-    has_key = cfg.serpapi_key or cfg.serper_key
-    data_dir_exists = os.path.isdir(os.path.abspath(cfg.data_dir))
+    data_dir_ok = os.path.isdir(os.path.abspath(cfg.data_dir))
     prices_path = os.path.join(os.path.abspath(cfg.data_dir), "prices.json")
-    prices_is_live = False
+    prices_live = False
     if os.path.exists(prices_path):
         try:
-            with open(prices_path) as f:
-                prices_is_live = not json.load(f).get("is_demo", True)
+            with open(prices_path) as f2:
+                prices_live = not json.load(f2).get("is_demo", True)
         except Exception:
             pass
 
-    if has_key and prices_is_live:
-        print(f"  {G}🎉 Everything looks good — dashboard should show live data!{E}")
+    if data_dir_ok and prices_live:
+        print(f"  {G}🎉 Everything looks good!{E}")
     else:
-        issues = []
-        if not has_key:
-            issues.append("No API key → engine outputs demo data")
-        if not data_dir_exists:
-            issues.append("Data directory missing → JSON not written")
-        if not prices_is_live:
-            issues.append("prices.json contains demo data → set a real API key and re-run")
-        for i in issues:
-            print(f"  {R}⚠️  {i}{E}")
-        print(f"\n  {W}Quick fix steps:{E}")
-        if not has_key:
-            print(f"  {W}  1. Get a free key at serper.dev (2,500/month){E}")
-            print(f"  {W}  2. In GitHub: Settings → Secrets → Actions → New secret{E}")
-            print(f"  {W}     Name: SERPER_KEY   Value: your-key-here{E}")
-            print(f"  {W}  3. Re-run the workflow: Actions → Fetch prices → Run workflow{E}")
+        if not data_dir_ok:
+            print(f"  {R}⚠️  Data directory missing — check DATA_DIR env var{E}")
+        if not prices_live:
+            print(f"  {W}⚠️  prices.json is demo or missing — run: python main.py{E}")
 
-    print(f"\n{B}{'═'*60}{E}\n")
+    print(f"\n{B}{'═'*62}{E}\n")
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description="NS2 Price Tracker Engine")
