@@ -15,6 +15,7 @@ on:
           - fetch
           - export-only
           - status
+          - diagnose
 
 jobs:
   fetch-prices:
@@ -38,33 +39,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r engine/requirements.txt
 
-      # ── Diagnose secrets before running ──────────────────────────────────────
-      # This step prints clearly whether each secret is set or empty.
-      # It never prints the actual key value.
-      - name: Check secrets
-        env:
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
-        run: |
-          echo "=== Secret check ==="
-          if [ -n "$SERPAPI_KEY" ]; then
-            echo "✅ SERPAPI_KEY is set (length: ${#SERPAPI_KEY})"
-          else
-            echo "❌ SERPAPI_KEY is NOT set"
-          fi
-          if [ -n "$SERPER_KEY" ]; then
-            echo "✅ SERPER_KEY is set (length: ${#SERPER_KEY})"
-          else
-            echo "❌ SERPER_KEY is NOT set"
-          fi
-          if [ -z "$SERPAPI_KEY" ] && [ -z "$SERPER_KEY" ]; then
-            echo ""
-            echo "⚠️  WARNING: No API keys found — engine will use demo data."
-            echo "   Add SERPAPI_KEY or SERPER_KEY in:"
-            echo "   Settings → Secrets and variables → Actions → New repository secret"
-          fi
-          echo "===================="
-
       # ── Restore SQLite DB from cache ──────────────────────────────────────────
       - name: Restore DB cache
         uses: actions/cache@v4
@@ -74,48 +48,48 @@ jobs:
           restore-keys: |
             ns2-db-
 
-      # ── Run diagnostics first (always visible in Actions log) ───────────────
+      # ── Diagnostics ───────────────────────────────────────────────────────────
       - name: Diagnose configuration
         env:
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
-          DATA_DIR:    ${{ github.workspace }}/dashboard/data
+          DATA_DIR: ${{ github.workspace }}/dashboard/data
         working-directory: engine
         run: python main.py --diagnose
 
       # ── Run engine ────────────────────────────────────────────────────────────
-      # DATA_DIR is set as an absolute path relative to GITHUB_WORKSPACE
-      # so it is correct regardless of working-directory.
       - name: Run price engine
         env:
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
-          DATA_DIR:    ${{ github.workspace }}/dashboard/data
+          DATA_DIR: ${{ github.workspace }}/dashboard/data
         working-directory: engine
         run: |
           MODE="${{ github.event.inputs.mode || 'fetch' }}"
-          echo "Running in mode: $MODE"
-          echo "DATA_DIR=$DATA_DIR"
-          if [ "$MODE" = "export-only" ]; then
-            python main.py --export-only
-          elif [ "$MODE" = "status" ]; then
-            python main.py --status
-          else
-            python main.py
+          echo "Mode: $MODE"
+          if   [ "$MODE" = "export-only" ]; then python main.py --export-only
+          elif [ "$MODE" = "status"      ]; then python main.py --status
+          elif [ "$MODE" = "diagnose"    ]; then echo "(already ran above)"
+          else python main.py
           fi
 
-      # ── Show what was written ─────────────────────────────────────────────────
+      # ── Show exported files ───────────────────────────────────────────────────
       - name: Show exported data
-        if: github.event.inputs.mode != 'status'
+        if: always()
         run: |
-          echo "=== dashboard/data contents ==="
-          ls -lh dashboard/data/
+          echo "=== dashboard/data ==="
+          ls -lh dashboard/data/ 2>/dev/null || echo "(no data dir)"
           echo ""
-          echo "=== prices.json (first 30 lines) ==="
-          head -30 dashboard/data/prices.json || echo "(file not found)"
-          echo ""
-          echo "=== meta.json ==="
-          cat dashboard/data/meta.json || echo "(file not found)"
+          echo "=== prices.json ==="
+          python3 -c "
+          import json, sys
+          try:
+              d = json.load(open('dashboard/data/prices.json'))
+              print(f'  source : {d.get(\"source\")}')
+              print(f'  is_demo: {d.get(\"is_demo\")}')
+              print(f'  updated: {d.get(\"updated_at\",\"\")[:19]}')
+              print(f'  listings ({len(d.get(\"listings\",[]))}) :')
+              for l in d.get('listings',[]):
+                  print(f'    {l[\"seller\"]:<22} {l[\"platform\"]:<12} Rp {l[\"price\"]:>10,}  {l[\"stock\"]}')
+          except Exception as e:
+              print(f'  error reading prices.json: {e}')
+          " 2>/dev/null || true
 
       # ── Upload engine log ─────────────────────────────────────────────────────
       - name: Upload engine log
@@ -128,7 +102,7 @@ jobs:
 
       # ── Commit updated JSON files ─────────────────────────────────────────────
       - name: Commit data files
-        if: github.event.inputs.mode != 'status'
+        if: github.event.inputs.mode != 'status' && github.event.inputs.mode != 'diagnose'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
