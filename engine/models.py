@@ -17,9 +17,10 @@ Base = declarative_base()
 class Seller(Base):
     """Known official sellers we track."""
     __tablename__ = "sellers"
+    __table_args__ = (UniqueConstraint('name', 'platform', name='uq_seller_name_platform'),)
 
     id         = Column(Integer, primary_key=True)
-    name       = Column(String(120), nullable=False, unique=True)
+    name       = Column(String(120), nullable=False)
     platform   = Column(String(40),  nullable=False)   # Tokopedia | Shopee | BliBli
     base_url   = Column(String(500), nullable=True)
     is_active  = Column(Boolean, default=True)
