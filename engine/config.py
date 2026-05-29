@@ -64,25 +64,8 @@ OFFICIAL_SELLERS = [
 
 SELLER_NAMES = [s["name"] for s in OFFICIAL_SELLERS]
 
-# ── Search queries fired per fetch cycle ──────────────────────────────────────
-SEARCH_QUERIES = [
-    {
-        "q":        "Nintendo Switch 2 harga resmi site:tokopedia.com PS Enterprise OR GSShop OR Wellcomm",
-        "platform": "Tokopedia",
-    },
-    {
-        "q":        "Nintendo Switch 2 harga resmi site:shopee.co.id Drakuli OR Supersonicgamestore OR Gameku",
-        "platform": "Shopee",
-    },
-    {
-        "q":        "Nintendo Switch 2 harga resmi site:blibli.com Gamestation OR iBox OR iSolution",
-        "platform": "BliBli",
-    },
-    {
-        "q":        "Nintendo Switch 2 Indonesia harga resmi 2025 toko resmi Tokopedia Shopee BliBli",
-        "platform": None,   # let URL detection decide
-    },
-]
+# SEARCH_QUERIES removed — the fetcher now builds one targeted query
+# per seller in OFFICIAL_SELLERS at runtime (see fetcher._build_query).
 
 # Fallback demo data used when no API keys are set (keeps dashboard non-empty)
 DEMO_LISTINGS = [
