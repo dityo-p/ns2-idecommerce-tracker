@@ -1,198 +1,50 @@
 """
-Price fetcher — uses a three-tier query strategy per seller to maximise
-the chance of finding real results from these specific stores.
+Price fetcher — calls each platform's own internal API directly using
+product IDs parsed from the user-supplied listing URLs.
 
-Why three tiers?
-  Tier 1 — inurl:store_slug + site:platform
-    Most targeted. Works when the store has a product page indexed by Google.
-    e.g. 'Nintendo Switch 2 inurl:psegameshop site:tokopedia.com'
+No search queries. No guessing. Each URL maps to one API call that returns
+price, stock, and product name for that exact listing.
 
-  Tier 2 — store_slug unquoted + site:platform  (no inurl)
-    Broader — catches cases where the slug appears in snippet but not URL.
-    e.g. 'Nintendo Switch 2 psegameshop site:tokopedia.com'
+Platform strategies
+───────────────────
+Tokopedia  →  GraphQL API (gql.tokopedia.com)
+               IDs parsed from URL: shop domain + numeric product_id (last segment)
 
-  Tier 3 — store_slug + platform name only  (no site: operator)
-    Widest net. Catches aggregator pages, review sites, and cached results
-    that mention both the store slug and the platform.
-    e.g. 'Nintendo Switch 2 psegameshop tokopedia harga'
+Shopee     →  REST API (shopee.co.id/api/v4/item/get)
+               IDs parsed from URL pattern: i.{shop_id}.{item_id}
 
-Each result is strictly validated:
-  - Must mention Nintendo Switch 2
-  - Result URL must come from the correct platform domain  (tiers 1 & 2)
-    OR the snippet must mention the platform  (tier 3)
-  - The store slug (not display name) must appear in the URL or snippet
-  - Must contain a parseable IDR price in range [1M–20M]
+BliBli     →  REST API (www.blibli.com/backend/product-detail/products/{sku}/sku)
+               SKU parsed from URL: /is--{sku} or /ps--{sku}
+               /is-- = individual SKU   → .../sku  endpoint
+               /ps-- = product set SKU  → .../sku  endpoint (same, BliBli normalises)
 
-A result that passes all four checks is accepted and the remaining tiers
-for that seller are skipped. If all three tiers fail, the seller is logged
-as not found — the existing DB row is preserved (not overwritten with blank).
+All fetchers share the same retry wrapper and return the same listing dict shape.
 """
 
 import re
+import json
 import time
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 
-from config import Config, OFFICIAL_SELLERS, DEMO_LISTINGS
+from config import Config, TRACKED_LISTINGS, DEMO_LISTINGS
 
 logger = logging.getLogger(__name__)
 
+# ── Shared HTTP headers ────────────────────────────────────────────────────────
 
-# ── Platform map ──────────────────────────────────────────────────────────────
-
-PLATFORM_DOMAINS = {
-    "tokopedia.com": "Tokopedia",
-    "shopee.co.id":  "Shopee",
-    "blibli.com":    "BliBli",
+HEADERS_BROWSER = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
 }
 
-PLATFORM_DOMAIN_MAP = {v: k for k, v in PLATFORM_DOMAINS.items()}   # reverse
 
-
-# ── Query builder ─────────────────────────────────────────────────────────────
-
-def _queries_for_seller(seller: dict) -> list[dict]:
-    """
-    Return three queries for one seller, from most-targeted to broadest.
-    Each dict has keys: q (query string), tier (int), require_platform_in_url (bool).
-    """
-    slug     = seller["store_slug"]
-    platform = seller["platform"]
-    domain   = PLATFORM_DOMAIN_MAP.get(platform, "")
-
-    return [
-        {
-            "tier": 1,
-            "q": f"Nintendo Switch 2 inurl:{slug} site:{domain}",
-            "require_platform_url": True,
-        },
-        {
-            "tier": 2,
-            "q": f"Nintendo Switch 2 {slug} site:{domain}",
-            "require_platform_url": True,
-        },
-        {
-            "tier": 3,
-            "q": f"Nintendo Switch 2 {slug} {platform} harga",
-            "require_platform_url": False,   # only require platform in snippet
-        },
-    ]
-
-
-# ── Validation helpers ────────────────────────────────────────────────────────
-
-def _detect_platform_from_url(url: str) -> Optional[str]:
-    url_lower = url.lower()
-    for domain, platform in PLATFORM_DOMAINS.items():
-        if domain in url_lower:
-            return platform
-    return None
-
-
-def _slug_in_result(url: str, snippet: str, slug: str) -> bool:
-    """Return True if the store slug appears in the URL or snippet."""
-    combined = (url + " " + snippet).lower()
-    return slug.lower() in combined
-
-
-def _extract_price(text: str, min_idr: int, max_idr: int) -> Optional[int]:
-    cleaned    = re.sub(r"[Rr][Pp]\.?\s*", "", text)
-    candidates = re.findall(r"\d{1,2}[.,]\d{3}(?:[.,]\d{3})+|\d{6,10}", cleaned)
-    for raw in candidates:
-        numeric = int(re.sub(r"[.,]", "", raw))
-        if min_idr <= numeric <= max_idr:
-            return numeric
-    return None
-
-
-def _classify_stock(snippet: str) -> str:
-    s = snippet.lower()
-    if any(w in s for w in ["habis", "out of stock", "kosong", "sold out", "stok habis"]):
-        return "out-stock"
-    if any(w in s for w in ["sisa", "limited", "hampir habis", "segera habis", "tersisa"]):
-        return "low-stock"
-    return "in-stock"
-
-
-def _classify_variant(text: str) -> str:
-    t = text.lower()
-    if any(w in t for w in ["mario kart", "bundle", "paket", "world"]):
-        return "With Mario Kart"
-    return "Standard"
-
-
-def _parse_items_for_seller(
-    items: list,
-    seller: dict,
-    require_platform_url: bool,
-    cfg: Config,
-) -> Optional[dict]:
-    """
-    Scan items for one result that passes all four validation checks.
-    Returns the first match, or None.
-    """
-    expected_platform = seller["platform"]
-    slug              = seller["store_slug"]
-    fallback_url      = seller["url"]
-
-    for item in items:
-        title   = item.get("title")   or ""
-        snippet = item.get("snippet") or item.get("description") or ""
-        link    = item.get("link")    or item.get("url") or ""
-        full    = title + " " + snippet + " " + link
-
-        # 1. Must mention Switch 2
-        if not re.search(r"nintendo\s*switch\s*2|switch\s*2|ns\s*2|ns2", full, re.I):
-            logger.debug(f"    skip (no Switch 2): {title[:55]}")
-            continue
-
-        # 2. Platform check
-        url_platform = _detect_platform_from_url(link)
-        if require_platform_url:
-            if url_platform != expected_platform:
-                logger.debug(f"    skip (platform {url_platform}≠{expected_platform}): {link[:55]}")
-                continue
-        else:
-            # Tier 3: platform must appear somewhere in the full text
-            if expected_platform.lower() not in full.lower():
-                logger.debug(f"    skip (platform not in text): {title[:55]}")
-                continue
-
-        # 3. Store slug must appear in URL or snippet
-        if not _slug_in_result(link, snippet, slug):
-            logger.debug(f"    skip (slug '{slug}' not found): {link[:55]}")
-            continue
-
-        # 4. Must have a valid IDR price
-        price = _extract_price(full, cfg.min_price_idr, cfg.max_price_idr)
-        if not price:
-            logger.debug(f"    skip (no price): {title[:55]}")
-            continue
-
-        variant = _classify_variant(full)
-        stock   = _classify_stock(snippet)
-        url     = link if (link and expected_platform.lower() in link.lower()) else fallback_url
-
-        logger.info(
-            f"    ✓ {seller['name']} @ {expected_platform}  "
-            f"Rp{price:,}  {variant}  {stock}"
-        )
-        return {
-            "seller":   seller["name"],
-            "platform": expected_platform,
-            "product":  "Nintendo Switch 2",
-            "variant":  variant,
-            "price":    price,
-            "stock":    stock,
-            "url":      url,
-        }
-
-    return None
-
-
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+# ── Retry wrapper ─────────────────────────────────────────────────────────────
 
 def _with_retry(fn, attempts: int, backoff: float):
     last_exc = None
@@ -202,53 +54,312 @@ def _with_retry(fn, attempts: int, backoff: float):
         except Exception as exc:
             last_exc = exc
             wait = backoff * (2 ** i)
-            logger.warning(f"Attempt {i+1}/{attempts} failed: {exc}. Retrying in {wait:.1f}s…")
+            logger.warning(f"  attempt {i+1}/{attempts} failed: {exc} — retry in {wait:.0f}s")
             time.sleep(wait)
     raise last_exc
 
 
-def _fetch_serpapi(query: str, cfg: Config) -> list:
+# ── Price / stock helpers ─────────────────────────────────────────────────────
+
+def _classify_stock(raw) -> str:
+    """Normalise various stock representations to in-stock / low-stock / out-stock."""
+    if raw is None:
+        return "in-stock"
+    if isinstance(raw, bool):
+        return "in-stock" if raw else "out-stock"
+    if isinstance(raw, (int, float)):
+        if raw <= 0:   return "out-stock"
+        if raw <= 5:   return "low-stock"
+        return "in-stock"
+    s = str(raw).lower()
+    if any(w in s for w in ["out", "habis", "kosong", "0", "false", "unavailable"]):
+        return "out-stock"
+    if any(w in s for w in ["low", "sisa", "limited", "hampir"]):
+        return "low-stock"
+    return "in-stock"
+
+
+def _classify_variant(name: str) -> str:
+    n = (name or "").lower()
+    if any(w in n for w in ["mario kart", "bundle", "paket", "world", "mk"]):
+        return "With Mario Kart"
+    return "Standard"
+
+
+def _clean_price(raw) -> Optional[int]:
+    """Convert any price representation to a plain IDR integer."""
+    if raw is None:
+        return None
+    try:
+        p = float(raw)
+        # Shopee stores price as IDR * 100000
+        if p > 1_000_000_000:
+            p = p / 100000
+        if 500_000 <= p <= 30_000_000:
+            return int(round(p))
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+# ── URL parsers ───────────────────────────────────────────────────────────────
+
+def _parse_tokopedia_url(url: str) -> Optional[dict]:
+    """
+    Extract shop_domain and product_id from a Tokopedia product URL.
+    URL pattern: tokopedia.com/{shop_domain}/{slug}-{product_id}
+    product_id is the last hyphen-separated numeric segment (≥15 digits).
+    """
+    path = urlparse(url).path.strip("/").split("/")
+    if len(path) < 2:
+        return None
+    shop_domain = path[0]
+    slug        = path[1]
+    # product_id is last segment after final '-', must be a long integer
+    product_id  = slug.rsplit("-", 1)[-1]
+    if not product_id.isdigit() or len(product_id) < 10:
+        return None
+    return {"shop_domain": shop_domain, "product_id": product_id, "slug": slug}
+
+
+def _parse_shopee_url(url: str) -> Optional[dict]:
+    """
+    Extract shop_id and item_id from a Shopee product URL.
+    URL pattern: shopee.co.id/...-i.{shop_id}.{item_id}
+    """
+    m = re.search(r'i\.(\d+)\.(\d+)', url)
+    if not m:
+        return None
+    return {"shop_id": m.group(1), "item_id": m.group(2)}
+
+
+def _parse_blibli_url(url: str) -> Optional[dict]:
+    """
+    Extract SKU from a BliBli product URL.
+    Patterns:
+      /is--{sku}  — individual product SKU
+      /ps--{sku}  — product set SKU
+    """
+    m = re.search(r'/(is|ps)--([^/?#]+)', url)
+    if not m:
+        return None
+    return {"sku_type": m.group(1), "sku": m.group(2)}
+
+
+# ── Platform fetchers ─────────────────────────────────────────────────────────
+
+def _fetch_tokopedia(listing: dict, cfg: Config) -> dict:
+    """
+    Call Tokopedia's GraphQL API for one product listing.
+    Uses the PDPGetLayoutQuery which powers the web product page.
+    """
+    parsed = _parse_tokopedia_url(listing["url"])
+    if not parsed:
+        raise ValueError(f"Cannot parse Tokopedia URL: {listing['url']}")
+
+    gql_url = "https://gql.tokopedia.com/"
+    headers = {
+        **HEADERS_BROWSER,
+        "Content-Type":        "application/json",
+        "X-Source":            "tokopedia-lite",
+        "X-Tkpd-App-Version":  "3.0",
+        "X-Device":            "desktop-0.0",
+        "X-Tkpd-UserId":       "0",
+        "Referer":             "https://www.tokopedia.com/",
+        "Origin":              "https://www.tokopedia.com",
+        "Accept":              "*/*",
+    }
+
+    payload = [
+        {
+            "operationName": "PDPGetLayoutQuery",
+            "variables": {
+                "shopDomain":  parsed["shop_domain"],
+                "productKey":  parsed["slug"],
+                "layoutID":    "",
+                "apiVersion":  1,
+                "userLocation": {
+                    "cityID":       "176",
+                    "addressID":    "0",
+                    "districtID":   "2274",
+                    "postalCode":   "12950",
+                    "latlon":       "",
+                },
+                "extParam": "",
+            },
+            "query": """
+                query PDPGetLayoutQuery($shopDomain: String, $productKey: String, $layoutID: String, $apiVersion: Float, $userLocation: pdpUserLocation, $extParam: String) {
+                  pdpGetLayout(shopDomain: $shopDomain, productKey: $productKey, layoutID: $layoutID, apiVersion: $apiVersion, userLocation: $userLocation, extParam: $extParam) {
+                    basicInfo {
+                      alias
+                      stats { priceMin priceMax }
+                      stock { useParallelStock stockQty }
+                      txStats { transactionSuccess }
+                    }
+                  }
+                }
+            """,
+        }
+    ]
+
     def call():
-        resp = requests.get(
-            "https://serpapi.com/search.json",
-            params={"q": query, "gl": "id", "hl": "id", "num": 10, "api_key": cfg.serpapi_key},
-            timeout=cfg.request_timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            raise ValueError(f"SerpApi error: {data['error']}")
-        return data.get("organic_results") or []
-    return _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
+        r = requests.post(gql_url, headers=headers, json=payload, timeout=cfg.request_timeout)
+        r.raise_for_status()
+        return r.json()
+
+    data    = _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
+    basic   = data[0]["data"]["pdpGetLayout"]["basicInfo"]
+    stats   = basic.get("stats", {})
+    stock_d = basic.get("stock", {})
+
+    name    = basic.get("alias") or listing["seller"] + " Nintendo Switch 2"
+    price   = _clean_price(stats.get("priceMin") or stats.get("priceMax"))
+    stock_q = stock_d.get("stockQty", 1)
+    stock   = _classify_stock(stock_q)
+    variant = _classify_variant(name)
+
+    if not price:
+        raise ValueError(f"No valid price in Tokopedia response for {listing['seller']}")
+
+    return {
+        "seller":   listing["seller"],
+        "platform": listing["platform"],
+        "product":  _clean_product_name(name),
+        "variant":  variant,
+        "price":    price,
+        "stock":    stock,
+        "url":      listing["url"],
+    }
 
 
-def _fetch_serper(query: str, cfg: Config) -> list:
+def _fetch_shopee(listing: dict, cfg: Config) -> dict:
+    """
+    Call Shopee's item detail API.
+    Price is returned as IDR × 100000 — divide by 100000.
+    """
+    parsed = _parse_shopee_url(listing["url"])
+    if not parsed:
+        raise ValueError(f"Cannot parse Shopee URL: {listing['url']}")
+
+    # v2 endpoint is less restricted than v4 and doesn't require CSRF cookies
+    api_url = f"https://shopee.co.id/api/v2/item/get?itemid={parsed['item_id']}&shopid={parsed['shop_id']}"
+    headers = {
+        **HEADERS_BROWSER,
+        "Referer":      "https://shopee.co.id/",
+        "X-Api-Source": "pc",
+        "If-None-Match": "",
+    }
+
     def call():
-        resp = requests.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": cfg.serper_key, "Content-Type": "application/json"},
-            json={"q": query, "gl": "id", "hl": "id", "num": 10},
-            timeout=cfg.request_timeout,
-        )
-        resp.raise_for_status()
-        return resp.json().get("organic") or []
-    return _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
+        r = requests.get(api_url, headers=headers, timeout=cfg.request_timeout)
+        r.raise_for_status()
+        body = r.json()
+        if body.get("error") and body["error"] != 0:
+            raise ValueError(f"Shopee API error {body['error']}: {body.get('error_msg','')}")
+        return body
+
+    body    = _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
+    item    = body.get("data") or {}
+    name    = item.get("name") or ""
+    price   = _clean_price(item.get("price") or item.get("price_min"))
+    stock_v = item.get("stock") if item.get("stock") is not None else item.get("item_status", 1)
+    stock   = _classify_stock(stock_v)
+    variant = _classify_variant(name)
+
+    if not price:
+        raise ValueError(f"No valid price in Shopee response for {listing['seller']}")
+
+    return {
+        "seller":   listing["seller"],
+        "platform": listing["platform"],
+        "product":  _clean_product_name(name) or "Nintendo Switch 2",
+        "variant":  variant,
+        "price":    price,
+        "stock":    stock,
+        "url":      listing["url"],
+    }
 
 
-def _fetch_query(query: str, cfg: Config) -> tuple[list, str]:
-    """Try SerpApi, fall back to Serper. Returns (items, source_name)."""
-    if cfg.has_serpapi():
-        try:
-            items = _fetch_serpapi(query, cfg)
-            logger.info(f"  SerpApi → {len(items)} results")
-            return items, "serpapi"
-        except Exception as exc:
-            logger.warning(f"  SerpApi failed ({exc}), trying Serper…")
-    if cfg.has_serper():
-        items = _fetch_serper(query, cfg)
-        logger.info(f"  Serper  → {len(items)} results")
-        return items, "serper"
-    raise RuntimeError("No API keys configured.")
+def _fetch_blibli(listing: dict, cfg: Config) -> dict:
+    """
+    Call BliBli's product-detail API using the SKU from the URL.
+    Both /is-- (individual) and /ps-- (product set) use the same endpoint.
+    """
+    parsed = _parse_blibli_url(listing["url"])
+    if not parsed:
+        raise ValueError(f"Cannot parse BliBli URL: {listing['url']}")
+
+    sku     = parsed["sku"]
+    api_url = f"https://www.blibli.com/backend/product-detail/products/{sku}/sku"
+    headers = {
+        **HEADERS_BROWSER,
+        "Referer":      "https://www.blibli.com/",
+        "Origin":       "https://www.blibli.com",
+        "Accept":       "application/json, text/plain, */*",
+        "channel-id":   "web",
+    }
+
+    def call():
+        r = requests.get(api_url, headers=headers, timeout=cfg.request_timeout)
+        r.raise_for_status()
+        return r.json()
+
+    body = _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
+    data = body.get("data") or {}
+
+    # BliBli nests price under data.sku.price or data.price
+    sku_data = data.get("sku") or {}
+    price_d  = sku_data.get("price") or data.get("price") or {}
+    name     = data.get("name") or sku_data.get("name") or ""
+    price    = _clean_price(
+        price_d.get("listed") or price_d.get("offer") or
+        data.get("priceDisplay") or data.get("price")
+    )
+    stock_v  = sku_data.get("stock") or data.get("stock")
+    stock    = _classify_stock(stock_v)
+    variant  = _classify_variant(name)
+
+    if not price:
+        raise ValueError(f"No valid price in BliBli response for {listing['seller']}")
+
+    return {
+        "seller":   listing["seller"],
+        "platform": listing["platform"],
+        "product":  _clean_product_name(name) or "Nintendo Switch 2",
+        "variant":  variant,
+        "price":    price,
+        "stock":    stock,
+        "url":      listing["url"],
+    }
+
+
+def _clean_product_name(raw: str) -> str:
+    """Shorten overly long product names to something dashboard-friendly (≤60 chars)."""
+    if not raw:
+        return "Nintendo Switch 2"
+    # Strip excessive repetition common in Indonesian marketplace titles
+    name = re.sub(r'\s+', ' ', raw).strip()
+    # If name is very long, extract a clean prefix up to the first '/'  or '-' or ','
+    if len(name) > 60:
+        for sep in ['/', ' - ', ',', '|']:
+            if sep in name:
+                name = name.split(sep)[0].strip()
+                break
+    return name[:80]
+
+
+# ── Dispatcher ────────────────────────────────────────────────────────────────
+
+def _fetch_one(listing: dict, cfg: Config) -> dict:
+    """Route one listing to the correct platform fetcher."""
+    platform = listing["platform"]
+    if platform == "Tokopedia":
+        return _fetch_tokopedia(listing, cfg)
+    if platform == "Shopee":
+        return _fetch_shopee(listing, cfg)
+    if platform == "BliBli":
+        return _fetch_blibli(listing, cfg)
+    raise ValueError(f"Unknown platform: {platform}")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -265,72 +376,51 @@ class FetchResult:
 
 def fetch_all(cfg: Config) -> FetchResult:
     """
-    For each seller in OFFICIAL_SELLERS, try up to three query tiers until
-    a valid result is found. Strictly validates seller slug + platform on
-    every result — random stores are never accepted.
+    Fetch price + stock for every URL in TRACKED_LISTINGS by calling
+    each platform's own API directly. No search queries, no guessing.
+
+    Falls back to DEMO_LISTINGS only when ALL fetches fail.
+    Partial results (some listings succeed, some fail) are still returned —
+    failed listings retain their last-known value from the DB.
     """
     result = FetchResult()
+    result.source = "direct-api"
 
-    if not cfg.has_any_key():
-        logger.warning("No API keys set — using demo data.")
-        result.listings = DEMO_LISTINGS
-        result.source   = "demo"
-        result.success  = True
-        result.is_demo  = True
-        return result
+    listings:   list[dict] = []
+    fail_count: int        = 0
 
-    listings:    list[dict] = []
-    source_used: str        = "unknown"
+    for entry in TRACKED_LISTINGS:
+        result.queries_fired += 1
+        label = f"{entry['seller']} @ {entry['platform']}"
+        logger.info(f"── Fetching {label}")
+        logger.info(f"   {entry['url'][:80]}")
 
-    for seller in OFFICIAL_SELLERS:
-        logger.info(f"── {seller['name']} @ {seller['platform']} (slug: {seller['store_slug']}) ──")
-        found = False
+        try:
+            listing = _fetch_one(entry, cfg)
+            listings.append(listing)
+            logger.info(
+                f"   ✓ price=Rp{listing['price']:,}  "
+                f"stock={listing['stock']}  variant={listing['variant']}"
+            )
+        except Exception as exc:
+            fail_count += 1
+            logger.error(f"   ✗ failed: {exc}")
 
-        for q_cfg in _queries_for_seller(seller):
-            tier  = q_cfg["tier"]
-            query = q_cfg["q"]
-            logger.info(f"  Tier {tier}: {query}")
-            result.queries_fired += 1
-
-            try:
-                items, source = _fetch_query(query, cfg)
-                source_used   = source
-
-                if not items:
-                    logger.info(f"  Tier {tier}: 0 results — trying next tier")
-                    continue
-
-                listing = _parse_items_for_seller(
-                    items, seller, q_cfg["require_platform_url"], cfg
-                )
-
-                if listing:
-                    listings.append(listing)
-                    found = True
-                    break   # stop trying tiers for this seller
-                else:
-                    logger.info(f"  Tier {tier}: results returned but none passed validation")
-
-            except Exception as exc:
-                logger.error(f"  Tier {tier} query failed: {exc}")
-
-        if not found:
-            logger.warning(f"  ✗ {seller['name']}: not found across all tiers — DB row preserved")
-
+    total = len(TRACKED_LISTINGS)
     logger.info(
-        f"\nFetch complete — {len(listings)}/{len(OFFICIAL_SELLERS)} sellers matched"
-        f"  source={source_used}  queries_fired={result.queries_fired}"
+        f"\nFetch complete — {len(listings)}/{total} succeeded, "
+        f"{fail_count}/{total} failed"
     )
 
     if listings:
         result.listings = listings
-        result.source   = source_used
         result.success  = True
     else:
-        logger.error("Zero valid listings found. DB not overwritten.")
-        result.listings = []
-        result.source   = source_used
+        logger.error("All fetches failed — falling back to demo data")
+        result.listings = DEMO_LISTINGS
+        result.source   = "demo"
         result.success  = False
-        result.error    = "No listings matched known sellers across all query tiers"
+        result.is_demo  = True
+        result.error    = "All platform API calls failed"
 
     return result
