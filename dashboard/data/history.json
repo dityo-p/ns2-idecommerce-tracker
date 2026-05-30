@@ -1,7 +1,19 @@
 {
-  "updated_at": "2026-05-30T11:10:19.952358+00:00",
-  "total": 2,
+  "updated_at": "2026-05-30T11:23:53.550414+00:00",
+  "total": 3,
   "records": [
+    {
+      "ts": "2026-05-30T11:23:53.542025",
+      "seller": "Supersonicgamestore",
+      "platform": "Shopee",
+      "product": "Nintendo Switch 2",
+      "variant": "Standard",
+      "price": 2461265,
+      "prev_price": null,
+      "stock": "in-stock",
+      "url": "https://shopee.co.id/PROMO!-Nintendo-Switch2-Console-Nintendo-Switch-2-Nintendo-2-Switch-2-Switch2-i.12523743.24545210190",
+      "source": "playwright"
+    },
     {
       "ts": "2026-05-30T11:10:19.944678",
       "seller": "Supersonicgamestore",
