@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Nintendo Switch 2 Price Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .product { border: 1px solid #ccc; padding: 15px; margin-bottom: 30px; border-radius: 8px; }
+    .info { margin-bottom: 10px; }
+    canvas { max-height: 200px; }
+  </style>
+</head>
+<body>
+  <h1>Nintendo Switch 2 Price Tracker (Indonesia)</h1>
+  <p>Auto‑updated every 30 minutes via GitHub Actions.</p>
+  <div id="app">Loading data...</div>
+
+  <script>
+    const DATA_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/data.json";
+
+    async function loadDashboard() {
+      try {
+        const resp = await fetch(DATA_URL);
+        const data = await resp.json();
+        const app = document.getElementById("app");
+        app.innerHTML = "";
+
+        for (const [key, product] of Object.entries(data)) {
+          const div = document.createElement("div");
+          div.className = "product";
+          const price = product.current_price ? `Rp${product.current_price.toLocaleString("id-ID")}` : "N/A";
+          const updated = product.last_updated ? product.last_updated.replace("T", " ").slice(0, 16) : "never";
+          div.innerHTML = `
+            <div class="info">
+              <strong>${product.name}</strong> (${product.platform})<br>
+              Current Price: <span style="font-size:1.2em;">${price}</span><br>
+              Last updated: ${updated}
+            </div>
+            <canvas id="chart-${key.replace(/[^a-zA-Z0-9]/g, '_')}" width="400" height="200"></canvas>
+          `;
+          app.appendChild(div);
+
+          if (product.history && product.history.length > 0) {
+            const labels = product.history.map(h => h.timestamp.slice(0, 16).replace("T", " "));
+            const prices = product.history.map(h => h.price);
+            const ctx = document.getElementById(`chart-${key.replace(/[^a-zA-Z0-9]/g, '_')}`).getContext("2d");
+            new Chart(ctx, {
+              type: "line",
+              data: {
+                labels: labels,
+                datasets: [{
+                  label: "Price (Rp)",
+                  data: prices,
+                  borderColor: "blue",
+                  tension: 0.2,
+                  pointRadius: 2
+                }]
+              },
+              options: {
+                scales: { y: { beginAtZero: false } },
+                plugins: { legend: { display: false } }
+              }
+            });
+          }
+        }
+      } catch (e) {
+        document.getElementById("app").innerText = "Error loading data. Please try again later.";
+      }
+    }
+
+    loadDashboard();
+  </script>
+</body>
+</html>
