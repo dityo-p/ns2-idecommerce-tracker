@@ -1,269 +1,207 @@
 """
-Price fetcher — uses Google Shopping via SerpApi / Serper to get
-structured price data for each tracked listing.
+Price fetcher — uses Playwright (headless Chromium) to load each product
+page with full JavaScript execution, then extracts the price from the
+rendered DOM.
 
-Why Google Shopping instead of page fetching:
-  All three platforms (Tokopedia, Shopee, BliBli) render prices via
-  JavaScript. No static HTML fetcher — direct, Serper scrape, or
-  SerpApi cache — ever sees the price. Google Shopping, however,
-  indexes these product pages with full price data via its own crawler
-  (which has elevated platform access), and returns it as structured
-  JSON through the API. No IP blocking, no JS rendering needed.
+Why Playwright:
+  Tokopedia, Shopee, and BliBli are fully client-side rendered (React/Next.js).
+  The price is injected into the DOM by JavaScript after page load — it is
+  never present in static HTML. No HTTP-based approach (direct fetch, Serper
+  scrape, SerpApi cache, Google Shopping) can see it. A real browser is the
+  only solution that works reliably.
 
-Strategy per listing:
-  1. Build a targeted Google Shopping query:
-       "Nintendo Switch 2 {shop_slug} site:{platform_domain}"
-     e.g. "Nintendo Switch 2 teknotrend site:tokopedia.com"
-  2. Call SerpApi engine=google_shopping (primary) or Serper shopping
-     endpoint (fallback). Both return structured shopping_results[].
-  3. Find the result whose link most closely matches our tracked URL.
-     If no link match, accept the first result with a valid IDR price.
-  4. Use shopping_results[].extracted_price — already a clean float.
+How it runs:
+  GitHub Actions provides Ubuntu runners with Chromium available via
+  `playwright install chromium`. The browser runs headless (no display needed).
+  Each product URL is opened, we wait for the price element to appear, then
+  extract the text and parse the IDR amount.
 
-Credit usage:
-  9 listings × 2 runs/day × 30 days = 540 queries/month.
-  SerpApi free tier:  100/month  (fallback only — Serper used first)
-  Serper free tier: 2,500/month  (primary — well within limit)
+Platform-specific CSS selectors (tried in order until one matches):
+  Tokopedia  →  data-testid="lblPDPDetailProductPrice"  (stable test ID)
+  Shopee     →  data-sqe="price" or class*="price"
+  BliBli     →  data-testid="product-detail-price" or class*="product-price"
+
+Fallback:  regex scan of the entire page text for "Rp X.XXX.XXX" pattern.
 """
 
 import re
 import time
 import logging
 from typing import Optional
-from urllib.parse import urlparse
 
-import requests
-
-from config import Config, TRACKED_LISTINGS, DEMO_LISTINGS, PLATFORM_DOMAIN
+from config import Config, TRACKED_LISTINGS, DEMO_LISTINGS
 
 logger = logging.getLogger(__name__)
 
 
-# ── Query builder ─────────────────────────────────────────────────────────────
+# ── CSS selector lists per platform ──────────────────────────────────────────
+# Ordered by specificity — most stable / specific first.
 
-def _build_query(listing: dict) -> str:
-    """
-    Build a Google Shopping query that targets one specific seller
-    on one specific platform.
-    """
-    slug   = listing["shop_slug"]
-    domain = PLATFORM_DOMAIN[listing["platform"]]
-    return f'Nintendo Switch 2 {slug} site:{domain}'
+PRICE_SELECTORS = {
+    "Tokopedia": [
+        '[data-testid="lblPDPDetailProductPrice"]',
+        '[data-testid="price"]',
+        'div[class*="ProductPrice"]',
+        'h3[class*="price"]',
+        'span[class*="price"]',
+    ],
+    "Shopee": [
+        'div[data-sqe="price"]',
+        'div[class*="product-price"]',
+        'span[class*="product-price"]',
+        '[class*="ProductPrice"]',
+        'div[class*="price"] span',
+    ],
+    "BliBli": [
+        '[data-testid="product-detail-price"]',
+        'div[class*="product-detail__price"]',
+        'div[class*="product-price"]',
+        'span[class*="FinalPrice"]',
+        'span[class*="price"]',
+    ],
+}
 
-
-# ── API callers ───────────────────────────────────────────────────────────────
-
-def _serpapi_shopping(query: str, cfg: Config) -> list:
-    """Call SerpApi Google Shopping engine. Returns shopping_results list."""
-    resp = requests.get(
-        "https://serpapi.com/search",
-        params={
-            "engine":  "google_shopping",
-            "q":       query,
-            "api_key": cfg.serpapi_key,
-            "gl":      "id",
-            "hl":      "id",
-            "num":     "10",
-        },
-        timeout=cfg.request_timeout,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise ValueError(f"SerpApi error: {data['error']}")
-    return data.get("shopping_results") or []
-
-
-def _serper_shopping(query: str, cfg: Config) -> list:
-    """
-    Call Serper Google Shopping endpoint. Returns shopping results list.
-    Serper's /shopping endpoint mirrors Google Shopping and returns:
-      title, source, price, link, rating, imageUrl
-    """
-    resp = requests.post(
-        "https://google.serper.dev/shopping",
-        headers={
-            "X-API-KEY":    cfg.serper_key,
-            "Content-Type": "application/json",
-        },
-        json={
-            "q":   query,
-            "gl":  "id",
-            "hl":  "id",
-            "num": 10,
-        },
-        timeout=cfg.request_timeout,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("shopping") or []
-
-
-# ── Retry wrapper ─────────────────────────────────────────────────────────────
-
-def _with_retry(fn, attempts: int, backoff: float):
-    last_exc = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except Exception as exc:
-            last_exc = exc
-            wait = backoff * (2 ** i)
-            logger.warning(f"  attempt {i+1}/{attempts} failed: {exc} — retry in {wait:.0f}s")
-            time.sleep(wait)
-    raise last_exc
-
-
-# ── Result picking ────────────────────────────────────────────────────────────
-
-def _normalise_results(raw: list, source: str) -> list:
-    """
-    Normalise SerpApi and Serper results to a common shape:
-    [{"title", "source", "price_str", "price", "link", "in_stock"}, ...]
-    """
-    out = []
-    for r in raw:
-        # SerpApi uses "extracted_price"; Serper uses "price" as string
-        price_float = r.get("extracted_price")
-        if price_float is None:
-            price_str = str(r.get("price") or "")
-            digits = re.sub(r"[^\d]", "", price_str)
-            price_float = float(digits) if digits else None
-
-        if price_float is None:
-            continue
-
-        # Shopee encodes in micros
-        if price_float > 1_000_000_000:
-            price_float /= 100_000
-
-        if not (1_000_000 <= price_float <= 30_000_000):
-            continue
-
-        out.append({
-            "title":    r.get("title") or "",
-            "source":   r.get("source") or "",
-            "price":    int(round(price_float)),
-            "link":     r.get("link") or r.get("product_link") or "",
-            "in_stock": "out of stock" not in (r.get("title") or "").lower()
-                        and "out of stock" not in (r.get("extensions") or []),
-        })
-    return out
-
-
-def _best_result(results: list, listing: dict) -> Optional[dict]:
-    """
-    Pick the best result for a listing.
-    Preference order:
-      1. Result whose link contains the exact product URL path
-      2. Result whose link contains the shop slug
-      3. Result whose source field contains the seller name
-      4. First result (already filtered to correct domain by site: operator)
-    """
-    slug        = listing["shop_slug"].lower()
-    seller      = listing["seller"].lower()
-    target_url  = listing["url"]
-    target_path = urlparse(target_url).path.lower()
-
-    # Score each result
-    def score(r):
-        link   = r["link"].lower()
-        source = r["source"].lower()
-        if target_path and target_path[:40] in link:
-            return 3
-        if slug in link or slug in source:
-            return 2
-        if seller.replace(" ", "").lower() in source.replace(" ", "").lower():
-            return 1
-        return 0
-
-    scored = sorted(results, key=score, reverse=True)
-    return scored[0] if scored else None
+# How long to wait for the price element before falling back to full-page text
+PRICE_WAIT_MS   = 12_000   # 12 seconds
+NAV_TIMEOUT_MS  = 30_000   # 30 seconds navigation timeout
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _classify_variant(title: str) -> str:
-    t = title.lower()
-    if any(w in t for w in ["mario kart", "bundle", "paket", "world", "mk"]):
+def _parse_idr(text: str, min_idr: int = 1_000_000, max_idr: int = 30_000_000) -> Optional[int]:
+    """
+    Extract the first plausible IDR price from a string.
+    Handles: Rp6.299.000 / Rp 6.299.000 / 6,299,000 / 6299000
+    """
+    # Remove currency symbol
+    cleaned = re.sub(r"Rp\.?\s*", "", text, flags=re.I)
+    # Find all numeric blobs
+    for m in re.finditer(r"[\d]{1,2}(?:[.,]\d{3})+|\d{6,10}", cleaned):
+        try:
+            value = int(re.sub(r"[.,]", "", m.group()))
+            if min_idr <= value <= max_idr:
+                return value
+        except ValueError:
+            continue
+    return None
+
+
+def _classify_variant(text: str) -> str:
+    t = text.lower()
+    if any(w in t for w in ["mario kart", "bundle", "paket", "world", "mk world"]):
         return "With Mario Kart"
     return "Standard"
 
 
-def _classify_stock(result: dict) -> str:
-    title = (result.get("title") or "").lower()
-    if any(w in title for w in ["habis", "out of stock", "kosong", "sold out"]):
+def _classify_stock(page_text: str) -> str:
+    t = page_text.lower()
+    if any(w in t for w in ["habis", "out of stock", "sold out", "stok habis", "kosong", "unavailable"]):
         return "out-stock"
+    if any(w in t for w in ["sisa", "limited", "hampir habis", "tersisa"]):
+        return "low-stock"
     return "in-stock"
 
 
 def _clean_title(raw: str) -> str:
-    name = re.sub(r'\s+', ' ', raw).strip()
-    for sep in [' - ', ' | ', ' / ', ',']:
+    name = re.sub(r"\s+", " ", raw).strip()
+    for sep in [" - ", " | ", " / ", ","]:
         if len(name) > 70 and sep in name:
             name = name.split(sep)[0].strip()
     return name[:80]
 
 
-# ── Per-listing fetcher ───────────────────────────────────────────────────────
+# ── Playwright page fetcher ───────────────────────────────────────────────────
 
-def _fetch_one(listing: dict, cfg: Config) -> dict:
-    query = _build_query(listing)
-    logger.info(f"   query: {query}")
+def _fetch_one_playwright(listing: dict, browser) -> dict:
+    """
+    Open one product URL in a new browser page, wait for the price to render,
+    extract and return the listing dict.
+    """
+    from playwright.sync_api import TimeoutError as PWTimeout
 
-    raw_results = []
-    source_used = "unknown"
+    url      = listing["url"]
+    platform = listing["platform"]
+    seller   = listing["seller"]
+    selectors = PRICE_SELECTORS.get(platform, [])
 
-    # Primary: Serper /shopping (2,500 free/month)
-    if cfg.has_serper():
-        try:
-            def call_serper():
-                return _serper_shopping(query, cfg)
-            raw = _with_retry(call_serper, cfg.retry_attempts, cfg.retry_backoff)
-            raw_results = _normalise_results(raw, "serper")
-            source_used = "serper"
-            logger.info(f"   Serper: {len(raw)} raw → {len(raw_results)} with price")
-        except Exception as exc:
-            logger.warning(f"   Serper failed: {exc}")
+    logger.info(f"   opening: {url}")
 
-    # Fallback: SerpApi /search?engine=google_shopping (100 free/month)
-    if not raw_results and cfg.has_serpapi():
-        try:
-            def call_serpapi():
-                return _serpapi_shopping(query, cfg)
-            raw = _with_retry(call_serpapi, cfg.retry_attempts, cfg.retry_backoff)
-            raw_results = _normalise_results(raw, "serpapi")
-            source_used = "serpapi"
-            logger.info(f"   SerpApi: {len(raw)} raw → {len(raw_results)} with price")
-        except Exception as exc:
-            logger.warning(f"   SerpApi failed: {exc}")
-
-    if not raw_results:
-        raise ValueError("No shopping results with a valid price returned by either API")
-
-    best = _best_result(raw_results, listing)
-    if not best:
-        raise ValueError("Could not match any result to this seller/listing")
-
-    price   = best["price"]
-    title   = _clean_title(best["title"]) or "Nintendo Switch 2"
-    variant = _classify_variant(title)
-    stock   = _classify_stock(best)
-
-    logger.info(
-        f"   ✓ Rp{price:,}  stock={stock}  variant={variant}  "
-        f"source={source_used}  matched='{best['title'][:50]}'"
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1280, "height": 800},
+        locale="id-ID",
+        extra_http_headers={
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+        },
     )
+    page = context.new_page()
 
-    return {
-        "seller":   listing["seller"],
-        "platform": listing["platform"],
-        "product":  title,
-        "variant":  variant,
-        "price":    price,
-        "stock":    stock,
-        "url":      listing["url"],   # always use our canonical URL
-    }
+    try:
+        page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+
+        # Try each CSS selector for the price element
+        price = None
+        for selector in selectors:
+            try:
+                element = page.wait_for_selector(
+                    selector,
+                    timeout=PRICE_WAIT_MS // len(selectors),
+                    state="visible",
+                )
+                if element:
+                    raw_text = element.inner_text()
+                    price = _parse_idr(raw_text)
+                    if price:
+                        logger.info(f"   price via selector '{selector}': Rp{price:,}")
+                        break
+            except PWTimeout:
+                continue
+            except Exception:
+                continue
+
+        # Fallback: scan the full page text
+        if not price:
+            logger.info("   selectors failed — scanning full page text")
+            # Wait a bit more for JS to finish rendering
+            page.wait_for_timeout(3000)
+            full_text = page.inner_text("body")
+            price = _parse_idr(full_text)
+            if price:
+                logger.info(f"   price via full text scan: Rp{price:,}")
+
+        if not price:
+            raise ValueError("No price found after full DOM scan")
+
+        # Get title and stock from page
+        full_text = page.inner_text("body") if "full_text" not in dir() else full_text
+        try:
+            title_el  = page.query_selector("h1, h2")
+            title_raw = title_el.inner_text() if title_el else f"Nintendo Switch 2 — {seller}"
+        except Exception:
+            title_raw = f"Nintendo Switch 2 — {seller}"
+
+        title   = _clean_title(title_raw)
+        variant = _classify_variant(title + " " + url)
+        stock   = _classify_stock(page.inner_text("body"))
+
+        logger.info(f"   ✓ Rp{price:,}  {stock}  {variant}")
+
+        return {
+            "seller":   seller,
+            "platform": platform,
+            "product":  title or "Nintendo Switch 2",
+            "variant":  variant,
+            "price":    price,
+            "stock":    stock,
+            "url":      url,
+        }
+
+    finally:
+        context.close()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -271,7 +209,7 @@ def _fetch_one(listing: dict, cfg: Config) -> dict:
 class FetchResult:
     def __init__(self):
         self.listings:      list[dict]    = []
-        self.source:        str           = "unknown"
+        self.source:        str           = "playwright"
         self.queries_fired: int           = 0
         self.success:       bool          = False
         self.error:         Optional[str] = None
@@ -279,44 +217,69 @@ class FetchResult:
 
 
 def fetch_all(cfg: Config) -> FetchResult:
+    """
+    Launch a single headless Chromium instance, fetch all tracked listings
+    sequentially (one browser context per listing), then close the browser.
+    """
+    from playwright.sync_api import sync_playwright
+
     result     = FetchResult()
     listings   = []
     fail_count = 0
 
-    if not cfg.has_any_key():
-        logger.warning("No API keys — using demo data.")
-        result.listings = DEMO_LISTINGS
-        result.source   = "demo"
-        result.success  = True
-        result.is_demo  = True
-        return result
+    logger.info("Launching headless Chromium via Playwright…")
 
-    for entry in TRACKED_LISTINGS:
-        result.queries_fired += 1
-        label = f"{entry['seller']} @ {entry['platform']}"
-        logger.info(f"── {label}")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+
         try:
-            listing = _fetch_one(entry, cfg)
-            listings.append(listing)
-        except Exception as exc:
-            fail_count += 1
-            logger.error(f"   ✗ {label}: {exc}")
+            for entry in TRACKED_LISTINGS:
+                result.queries_fired += 1
+                label = f"{entry['seller']} @ {entry['platform']}"
+                logger.info(f"── {label}")
 
-    # Determine dominant source
-    result.source = "serper" if cfg.has_serper() else "serpapi"
+                for attempt in range(cfg.retry_attempts):
+                    try:
+                        listing = _fetch_one_playwright(entry, browser)
+                        listings.append(listing)
+                        break
+                    except Exception as exc:
+                        wait = cfg.retry_backoff * (2 ** attempt)
+                        logger.warning(
+                            f"   attempt {attempt+1}/{cfg.retry_attempts} failed: {exc}"
+                            + (f" — retry in {wait:.0f}s" if attempt < cfg.retry_attempts - 1 else "")
+                        )
+                        if attempt < cfg.retry_attempts - 1:
+                            time.sleep(wait)
+                        else:
+                            fail_count += 1
+                            logger.error(f"   ✗ {label}: all retries failed")
+        finally:
+            browser.close()
 
     total = len(TRACKED_LISTINGS)
-    logger.info(f"\nFetch complete — {len(listings)}/{total} OK, {fail_count} failed")
+    logger.info(
+        f"\nFetch complete — {len(listings)}/{total} OK, {fail_count} failed"
+    )
 
     if listings:
         result.listings = listings
         result.success  = True
     else:
-        logger.error("All fetches failed — using demo data.")
+        logger.error("All fetches failed — falling back to demo data.")
         result.listings = DEMO_LISTINGS
         result.source   = "demo"
         result.success  = False
         result.is_demo  = True
-        result.error    = "All Google Shopping queries returned no usable price data"
+        result.error    = "All Playwright fetches failed"
 
     return result
