@@ -13,9 +13,12 @@ load_dotenv()
 
 @dataclass
 class Config:
-    # ── API Keys (only needed as Serper/SerpApi fallback; not used for URL fetching) ──
-    serpapi_key:   Optional[str] = field(default_factory=lambda: os.getenv("SERPAPI_KEY"))
+    # ── API Keys ──────────────────────────────────────────────────────────────────
+    # Both keys are already in your GitHub Secrets.
+    # Serper is tried first (POST /scrape endpoint).
+    # SerpApi is the fallback (Google cache fetch).
     serper_key:    Optional[str] = field(default_factory=lambda: os.getenv("SERPER_KEY"))
+    serpapi_key:   Optional[str] = field(default_factory=lambda: os.getenv("SERPAPI_KEY"))
 
     # ── Database ──────────────────────────────────────────────
     database_url: str = field(default_factory=lambda: os.getenv(
