@@ -1,13 +1,8 @@
 name: Fetch prices
 
 on:
-  # Twice a day — 9 AM and 9 PM WIB (02:00 and 14:00 UTC)
-  # 9 listings × 2 runs/day × 30 days = 540 requests/month
-  # Serper free tier: 2,500/month  |  SerpApi free tier: 100/month
-  # → Both are sufficient. Serper is primary; SerpApi is fallback.
   schedule:
-    - cron: "0 2,14 * * *"
-
+    - cron: "0 2,14 * * *"   # 9 AM and 9 PM WIB (02:00 and 14:00 UTC)
   workflow_dispatch:
     inputs:
       mode:
@@ -36,22 +31,14 @@ jobs:
           cache: pip
           cache-dependency-path: engine/requirements.txt
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: pip install -r engine/requirements.txt
 
-      - name: Check API keys
-        env:
-          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-        run: |
-          echo "=== API key check ==="
-          if [ -n "$SERPER_KEY" ];  then echo "✅ SERPER_KEY set  (${#SERPER_KEY} chars)"; else echo "❌ SERPER_KEY not set"; fi
-          if [ -n "$SERPAPI_KEY" ]; then echo "✅ SERPAPI_KEY set (${#SERPAPI_KEY} chars)"; else echo "❌ SERPAPI_KEY not set"; fi
-          if [ -z "$SERPER_KEY" ] && [ -z "$SERPAPI_KEY" ]; then
-            echo "⚠️  No keys found — will output demo data."
-          fi
-          echo "====================="
+      # Install Chromium browser binary — this is what actually runs the pages
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium --with-deps
 
+      # ── Restore SQLite DB ─────────────────────────────────────────────────
       - name: Restore DB cache
         uses: actions/cache@v4
         with:
@@ -62,17 +49,13 @@ jobs:
 
       - name: Diagnose configuration
         env:
-          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          DATA_DIR:    ${{ github.workspace }}/dashboard/data
+          DATA_DIR: ${{ github.workspace }}/dashboard/data
         working-directory: engine
         run: python main.py --diagnose
 
       - name: Run price engine
         env:
-          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          DATA_DIR:    ${{ github.workspace }}/dashboard/data
+          DATA_DIR: ${{ github.workspace }}/dashboard/data
         working-directory: engine
         run: |
           MODE="${{ github.event.inputs.mode || 'fetch' }}"
