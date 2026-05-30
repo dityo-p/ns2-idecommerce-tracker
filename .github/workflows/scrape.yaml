@@ -1,0 +1,35 @@
+name: Scrape Prices
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'   # At minute 0 of every 12th hour (00:00 and 12:00 UTC)
+  workflow_dispatch:          # manual trigger still available
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # needed to push changes
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python scrape.py
+
+      - name: Commit and push data.json
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update price data [skip ci]"
+          file_pattern: 'data.json'
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          push_options: '--force'
