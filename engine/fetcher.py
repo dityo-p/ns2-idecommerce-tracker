@@ -1,27 +1,28 @@
 """
-Price fetcher — uses Playwright (headless Chromium) to load each product
-page with full JavaScript execution, then extracts the price from the
-rendered DOM.
+Price fetcher — Playwright headless Chromium, one page per tracked listing.
 
-Why Playwright:
-  Tokopedia, Shopee, and BliBli are fully client-side rendered (React/Next.js).
-  The price is injected into the DOM by JavaScript after page load — it is
-  never present in static HTML. No HTTP-based approach (direct fetch, Serper
-  scrape, SerpApi cache, Google Shopping) can see it. A real browser is the
-  only solution that works reliably.
+Key design decisions
+────────────────────
+1. Seller name ALWAYS comes from config (listing["seller"]) — never from the page.
+   This fixes the "wrong seller name" problem: the h1/h2 on a product page may
+   show a different product title, but the seller is who we configured, full stop.
 
-How it runs:
-  GitHub Actions provides Ubuntu runners with Chromium available via
-  `playwright install chromium`. The browser runs headless (no display needed).
-  Each product URL is opened, we wait for the price element to appear, then
-  extract the text and parse the IDR amount.
+2. Price selector waits for the element to contain text matching "Rp [digits]",
+   not just for the element to exist. This ensures React has fully hydrated
+   before we read the price, fixing stale/cached prices.
 
-Platform-specific CSS selectors (tried in order until one matches):
-  Tokopedia  →  data-testid="lblPDPDetailProductPrice"  (stable test ID)
-  Shopee     →  data-sqe="price" or class*="price"
-  BliBli     →  data-testid="product-detail-price" or class*="product-price"
+3. Product name comes from the page (for display), but the seller association
+   is locked to config. If name extraction fails we fall back to
+   "Nintendo Switch 2" — never to a wrong seller name.
 
-Fallback:  regex scan of the entire page text for "Rp X.XXX.XXX" pattern.
+4. networkidle wait is avoided (too slow / unreliable on SPAs). Instead we
+   wait for the specific price selector text to be non-empty with a 15s timeout.
+
+Confirmed stable data-testid selectors (2025):
+  Tokopedia  data-testid="lblPDPDetailProductPrice"  (price)
+             data-testid="lblPDPDetailProductName"   (name)
+  Shopee     data-sqe="price"  OR  class*="product-price"
+  BliBli     data-testid="product-detail-price"  OR  class*="product-price"
 """
 
 import re
@@ -34,8 +35,9 @@ from config import Config, TRACKED_LISTINGS, DEMO_LISTINGS
 logger = logging.getLogger(__name__)
 
 
-# ── CSS selector lists per platform ──────────────────────────────────────────
-# Ordered by specificity — most stable / specific first.
+# ── Per-platform selectors ────────────────────────────────────────────────────
+# Each platform has a prioritised list of CSS selectors for the price element.
+# The first one that contains "Rp" text wins.
 
 PRICE_SELECTORS = {
     "Tokopedia": [
@@ -43,40 +45,39 @@ PRICE_SELECTORS = {
         '[data-testid="price"]',
         'div[class*="ProductPrice"]',
         'h3[class*="price"]',
-        'span[class*="price"]',
     ],
     "Shopee": [
         'div[data-sqe="price"]',
+        'section[data-sqe="price"]',
         'div[class*="product-price"]',
         'span[class*="product-price"]',
-        '[class*="ProductPrice"]',
-        'div[class*="price"] span',
+        'div[class*="Price"] span',
     ],
     "BliBli": [
         '[data-testid="product-detail-price"]',
         'div[class*="product-detail__price"]',
         'div[class*="product-price"]',
         'span[class*="FinalPrice"]',
-        'span[class*="price"]',
+        'div[class*="Price"]',
     ],
 }
 
-# How long to wait for the price element before falling back to full-page text
-PRICE_WAIT_MS   = 12_000   # 12 seconds
-NAV_TIMEOUT_MS  = 30_000   # 30 seconds navigation timeout
+NAME_SELECTORS = {
+    "Tokopedia": ['[data-testid="lblPDPDetailProductName"]', 'h1'],
+    "Shopee":    ['[data-sqe="name"] span', 'h1'],
+    "BliBli":    ['[data-testid="product-detail-name"]', 'h1'],
+}
+
+NAV_TIMEOUT_MS   = 45_000   # 45 s navigation timeout
+PRICE_TIMEOUT_MS = 15_000   # 15 s to wait for price element to appear
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Price parsing ─────────────────────────────────────────────────────────────
 
 def _parse_idr(text: str, min_idr: int = 1_000_000, max_idr: int = 30_000_000) -> Optional[int]:
-    """
-    Extract the first plausible IDR price from a string.
-    Handles: Rp6.299.000 / Rp 6.299.000 / 6,299,000 / 6299000
-    """
-    # Remove currency symbol
+    """Extract the first plausible IDR value from a string."""
     cleaned = re.sub(r"Rp\.?\s*", "", text, flags=re.I)
-    # Find all numeric blobs
-    for m in re.finditer(r"[\d]{1,2}(?:[.,]\d{3})+|\d{6,10}", cleaned):
+    for m in re.finditer(r"\d{1,2}(?:[.,]\d{3})+|\d{6,10}", cleaned):
         try:
             value = int(re.sub(r"[.,]", "", m.group()))
             if min_idr <= value <= max_idr:
@@ -86,16 +87,16 @@ def _parse_idr(text: str, min_idr: int = 1_000_000, max_idr: int = 30_000_000) -
     return None
 
 
-def _classify_variant(text: str) -> str:
-    t = text.lower()
-    if any(w in t for w in ["mario kart", "bundle", "paket", "world", "mk world"]):
+def _classify_variant(title: str, url: str) -> str:
+    text = (title + " " + url).lower()
+    if any(w in text for w in ["mario kart", "bundle", "paket", "world"]):
         return "With Mario Kart"
     return "Standard"
 
 
 def _classify_stock(page_text: str) -> str:
     t = page_text.lower()
-    if any(w in t for w in ["habis", "out of stock", "sold out", "stok habis", "kosong", "unavailable"]):
+    if any(w in t for w in ["habis", "out of stock", "sold out", "stok habis", "kosong"]):
         return "out-stock"
     if any(w in t for w in ["sisa", "limited", "hampir habis", "tersisa"]):
         return "low-stock"
@@ -110,21 +111,73 @@ def _clean_title(raw: str) -> str:
     return name[:80]
 
 
-# ── Playwright page fetcher ───────────────────────────────────────────────────
+# ── Playwright page loader ────────────────────────────────────────────────────
+
+def _get_price_from_page(page, platform: str, cfg: Config) -> Optional[int]:
+    """
+    Try each CSS selector for the platform. For each candidate element,
+    wait until it contains "Rp" text (confirming React has hydrated the price),
+    then parse and return the IDR value.
+    """  # noqa
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    selectors = PRICE_SELECTORS.get(platform, [])
+    timeout_each = PRICE_TIMEOUT_MS // max(len(selectors), 1)
+
+    for selector in selectors:
+        try:
+            # Wait for element to exist
+            element = page.wait_for_selector(
+                selector,
+                timeout=timeout_each,
+                state="visible",
+            )
+            if not element:
+                continue
+
+            # Poll until the text contains 'Rp' (React hasn't hydrated yet if empty)
+            for _ in range(20):
+                text = element.inner_text()
+                if "Rp" in text or re.search(r"\d{6}", text):
+                    price = _parse_idr(text, cfg.min_price_idr, cfg.max_price_idr)
+                    if price:
+                        logger.info(f"   ✓ price via '{selector}': {text.strip()!r} → Rp{price:,}")
+                        return price
+                page.wait_for_timeout(300)
+
+        except PWTimeout:
+            continue
+        except Exception as e:
+            logger.debug(f"   selector '{selector}' error: {e}")
+            continue
+
+    return None
+
+
+def _get_name_from_page(page, platform: str) -> Optional[str]:
+    """Extract product name from the page using stable selectors."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    selectors = NAME_SELECTORS.get(platform, ["h1"])
+    for selector in selectors:
+        try:
+            element = page.wait_for_selector(selector, timeout=5_000, state="visible")
+            if element:
+                text = element.inner_text().strip()
+                if len(text) > 5:
+                    return _clean_title(text)
+        except (PWTimeout, Exception):
+            continue
+    return None
+
 
 def _fetch_one_playwright(listing: dict, browser) -> dict:
     """
-    Open one product URL in a new browser page, wait for the price to render,
-    extract and return the listing dict.
+    Open one product page, extract price + name. Seller comes from config.
     """
-    from playwright.sync_api import TimeoutError as PWTimeout
-
     url      = listing["url"]
     platform = listing["platform"]
-    seller   = listing["seller"]
-    selectors = PRICE_SELECTORS.get(platform, [])
-
-    logger.info(f"   opening: {url}")
+    seller   = listing["seller"]   # ALWAYS from config — never from page
 
     context = browser.new_context(
         user_agent=(
@@ -134,66 +187,48 @@ def _fetch_one_playwright(listing: dict, browser) -> dict:
         ),
         viewport={"width": 1280, "height": 800},
         locale="id-ID",
-        extra_http_headers={
-            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
-        },
+        extra_http_headers={"Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8"},
     )
     page = context.new_page()
 
     try:
+        logger.info(f"   → {url}")
         page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
 
-        # Try each CSS selector for the price element
-        price = None
-        for selector in selectors:
-            try:
-                element = page.wait_for_selector(
-                    selector,
-                    timeout=PRICE_WAIT_MS // len(selectors),
-                    state="visible",
-                )
-                if element:
-                    raw_text = element.inner_text()
-                    price = _parse_idr(raw_text)
-                    if price:
-                        logger.info(f"   price via selector '{selector}': Rp{price:,}")
-                        break
-            except PWTimeout:
-                continue
-            except Exception:
-                continue
+        # Give the JS framework a moment to start hydrating
+        page.wait_for_timeout(2000)
 
-        # Fallback: scan the full page text
+        price = _get_price_from_page(page, platform, Config())
+
+        # Fallback: scan full body text for Rp pattern
         if not price:
-            logger.info("   selectors failed — scanning full page text")
-            # Wait a bit more for JS to finish rendering
+            logger.info("   selectors failed — scanning full body text")
             page.wait_for_timeout(3000)
-            full_text = page.inner_text("body")
-            price = _parse_idr(full_text)
+            body_text = page.inner_text("body")
+            price = _parse_idr(body_text)
             if price:
-                logger.info(f"   price via full text scan: Rp{price:,}")
+                logger.info(f"   ✓ price via body scan: Rp{price:,}")
 
         if not price:
-            raise ValueError("No price found after full DOM scan")
+            raise ValueError(f"Price not found on page ({len(page.content()):,} bytes HTML)")
 
-        # Get title and stock from page
-        full_text = page.inner_text("body") if "full_text" not in dir() else full_text
-        try:
-            title_el  = page.query_selector("h1, h2")
-            title_raw = title_el.inner_text() if title_el else f"Nintendo Switch 2 — {seller}"
-        except Exception:
-            title_raw = f"Nintendo Switch 2 — {seller}"
+        # Product name from page (display only — seller identity is locked to config)
+        name = _get_name_from_page(page, platform) or f"Nintendo Switch 2"
 
-        title   = _clean_title(title_raw)
-        variant = _classify_variant(title + " " + url)
-        stock   = _classify_stock(page.inner_text("body"))
+        # Stock and variant
+        body_text = page.inner_text("body")
+        stock   = _classify_stock(body_text)
+        variant = _classify_variant(name, url)
 
-        logger.info(f"   ✓ Rp{price:,}  {stock}  {variant}")
+        logger.info(
+            f"   seller={seller!r}  product={name[:50]!r}  "
+            f"price=Rp{price:,}  stock={stock}  variant={variant}"
+        )
 
         return {
-            "seller":   seller,
-            "platform": platform,
-            "product":  title or "Nintendo Switch 2",
+            "seller":   seller,    # from config
+            "platform": platform,  # from config
+            "product":  name,
             "variant":  variant,
             "price":    price,
             "stock":    stock,
@@ -202,6 +237,25 @@ def _fetch_one_playwright(listing: dict, browser) -> dict:
 
     finally:
         context.close()
+
+
+# ── Retry ─────────────────────────────────────────────────────────────────────
+
+def _fetch_with_retry(listing: dict, browser, cfg: Config) -> dict:
+    last_exc = None
+    for attempt in range(cfg.retry_attempts):
+        try:
+            return _fetch_one_playwright(listing, browser)
+        except Exception as exc:
+            last_exc = exc
+            wait = cfg.retry_backoff * (2 ** attempt)
+            logger.warning(
+                f"   attempt {attempt+1}/{cfg.retry_attempts} failed: {exc}"
+                + (f" — retry in {wait:.0f}s" if attempt < cfg.retry_attempts - 1 else "")
+            )
+            if attempt < cfg.retry_attempts - 1:
+                time.sleep(wait)
+    raise last_exc
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -217,17 +271,13 @@ class FetchResult:
 
 
 def fetch_all(cfg: Config) -> FetchResult:
-    """
-    Launch a single headless Chromium instance, fetch all tracked listings
-    sequentially (one browser context per listing), then close the browser.
-    """
     from playwright.sync_api import sync_playwright
 
     result     = FetchResult()
     listings   = []
     fail_count = 0
 
-    logger.info("Launching headless Chromium via Playwright…")
+    logger.info("Launching headless Chromium…")
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -246,36 +296,23 @@ def fetch_all(cfg: Config) -> FetchResult:
                 result.queries_fired += 1
                 label = f"{entry['seller']} @ {entry['platform']}"
                 logger.info(f"── {label}")
-
-                for attempt in range(cfg.retry_attempts):
-                    try:
-                        listing = _fetch_one_playwright(entry, browser)
-                        listings.append(listing)
-                        break
-                    except Exception as exc:
-                        wait = cfg.retry_backoff * (2 ** attempt)
-                        logger.warning(
-                            f"   attempt {attempt+1}/{cfg.retry_attempts} failed: {exc}"
-                            + (f" — retry in {wait:.0f}s" if attempt < cfg.retry_attempts - 1 else "")
-                        )
-                        if attempt < cfg.retry_attempts - 1:
-                            time.sleep(wait)
-                        else:
-                            fail_count += 1
-                            logger.error(f"   ✗ {label}: all retries failed")
+                try:
+                    listing = _fetch_with_retry(entry, browser, cfg)
+                    listings.append(listing)
+                except Exception as exc:
+                    fail_count += 1
+                    logger.error(f"   ✗ {label}: {exc}")
         finally:
             browser.close()
 
     total = len(TRACKED_LISTINGS)
-    logger.info(
-        f"\nFetch complete — {len(listings)}/{total} OK, {fail_count} failed"
-    )
+    logger.info(f"\nFetch complete — {len(listings)}/{total} OK, {fail_count} failed")
 
     if listings:
         result.listings = listings
         result.success  = True
     else:
-        logger.error("All fetches failed — falling back to demo data.")
+        logger.error("All fetches failed — using demo data.")
         result.listings = DEMO_LISTINGS
         result.source   = "demo"
         result.success  = False
