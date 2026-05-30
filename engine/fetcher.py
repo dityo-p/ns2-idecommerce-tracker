@@ -1,177 +1,102 @@
 """
-Price fetcher — uses Serper /scrape and SerpApi html-output to fetch
-product page content, bypassing the IP blocks on Tokopedia/Shopee/BliBli.
+Price fetcher — uses Google Shopping via SerpApi / Serper to get
+structured price data for each tracked listing.
 
-How it works
-────────────
-Both services route the request through their own infrastructure
-(Google-indexed cache or residential proxies), so GitHub Actions'
-datacenter IP never touches the Indonesian platform servers directly.
+Why Google Shopping instead of page fetching:
+  All three platforms (Tokopedia, Shopee, BliBli) render prices via
+  JavaScript. No static HTML fetcher — direct, Serper scrape, or
+  SerpApi cache — ever sees the price. Google Shopping, however,
+  indexes these product pages with full price data via its own crawler
+  (which has elevated platform access), and returns it as structured
+  JSON through the API. No IP blocking, no JS rendering needed.
 
-  Primary:  Serper.dev  POST https://scrape.serper.dev
-            Sends the target URL; returns the page HTML/text.
-            Uses the SERPER_KEY secret already in your repo.
+Strategy per listing:
+  1. Build a targeted Google Shopping query:
+       "Nintendo Switch 2 {shop_slug} site:{platform_domain}"
+     e.g. "Nintendo Switch 2 teknotrend site:tokopedia.com"
+  2. Call SerpApi engine=google_shopping (primary) or Serper shopping
+     endpoint (fallback). Both return structured shopping_results[].
+  3. Find the result whose link most closely matches our tracked URL.
+     If no link match, accept the first result with a valid IDR price.
+  4. Use shopping_results[].extracted_price — already a clean float.
 
-  Fallback: SerpApi     GET  https://serpapi.com/search?engine=google&q=cache:{url}
-            Fetches Google's cached copy of the page, which contains
-            the full product data in __NEXT_DATA__ / JSON-LD / og: tags.
-            Uses the SERPAPI_KEY secret already in your repo.
-
-After fetching we extract the price using four strategies in order:
-  1. __NEXT_DATA__ JSON blob    (Tokopedia, Shopee embed full product state here)
-  2. JSON-LD structured data    (Schema.org Product / Offer — all three platforms)
-  3. OpenGraph meta tags        (og:price:amount — all three platforms)
-  4. Rp regex on visible text   (last resort)
+Credit usage:
+  9 listings × 2 runs/day × 30 days = 540 queries/month.
+  SerpApi free tier:  100/month  (fallback only — Serper used first)
+  Serper free tier: 2,500/month  (primary — well within limit)
 """
 
 import re
-import json
 import time
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
 
-from config import Config, TRACKED_LISTINGS, DEMO_LISTINGS
+from config import Config, TRACKED_LISTINGS, DEMO_LISTINGS, PLATFORM_DOMAIN
 
 logger = logging.getLogger(__name__)
 
 
-# ── Proxy/cache fetchers ──────────────────────────────────────────────────────
+# ── Query builder ─────────────────────────────────────────────────────────────
 
-def _fetch_via_serper(url: str, cfg: Config) -> str:
+def _build_query(listing: dict) -> str:
     """
-    Fetch a URL through Serper's /scrape endpoint.
-    Returns the page text content (may be Markdown or HTML depending on response).
+    Build a Google Shopping query that targets one specific seller
+    on one specific platform.
+    """
+    slug   = listing["shop_slug"]
+    domain = PLATFORM_DOMAIN[listing["platform"]]
+    return f'Nintendo Switch 2 {slug} site:{domain}'
+
+
+# ── API callers ───────────────────────────────────────────────────────────────
+
+def _serpapi_shopping(query: str, cfg: Config) -> list:
+    """Call SerpApi Google Shopping engine. Returns shopping_results list."""
+    resp = requests.get(
+        "https://serpapi.com/search",
+        params={
+            "engine":  "google_shopping",
+            "q":       query,
+            "api_key": cfg.serpapi_key,
+            "gl":      "id",
+            "hl":      "id",
+            "num":     "10",
+        },
+        timeout=cfg.request_timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise ValueError(f"SerpApi error: {data['error']}")
+    return data.get("shopping_results") or []
+
+
+def _serper_shopping(query: str, cfg: Config) -> list:
+    """
+    Call Serper Google Shopping endpoint. Returns shopping results list.
+    Serper's /shopping endpoint mirrors Google Shopping and returns:
+      title, source, price, link, rating, imageUrl
     """
     resp = requests.post(
-        "https://scrape.serper.dev",
+        "https://google.serper.dev/shopping",
         headers={
             "X-API-KEY":    cfg.serper_key,
             "Content-Type": "application/json",
         },
-        json={"url": url},
-        timeout=30,
-    )
-    if resp.status_code == 403:
-        raise RuntimeError("Serper /scrape: 403 — key invalid or endpoint not available on your plan")
-    if resp.status_code == 429:
-        raise RuntimeError("Serper /scrape: 429 — rate limited")
-    resp.raise_for_status()
-
-    data = resp.json()
-    # Serper /scrape returns {"text": "...", "markdown": "..."}
-    # We prefer the raw text/html content
-    return data.get("html") or data.get("markdown") or data.get("text") or ""
-
-
-def _fetch_via_serpapi_cache(url: str, cfg: Config) -> str:
-    """
-    Fetch Google's cached copy of a URL via SerpApi.
-    Uses engine=google with q=cache:{url} and output=html to get the raw HTML.
-    Google's cache contains the full Next.js hydration data and JSON-LD.
-    """
-    resp = requests.get(
-        "https://serpapi.com/search",
-        params={
-            "engine":   "google",
-            "q":        f"cache:{url}",
-            "api_key":  cfg.serpapi_key,
-            "output":   "html",
-            "num":      "1",
+        json={
+            "q":   query,
+            "gl":  "id",
+            "hl":  "id",
+            "num": 10,
         },
-        timeout=30,
-    )
-    if resp.status_code == 429:
-        raise RuntimeError("SerpApi: 429 — rate limited or quota reached")
-    resp.raise_for_status()
-
-    # output=html returns the raw HTML of Google's cached page
-    return resp.text
-
-
-def _fetch_via_serpapi_json(url: str, cfg: Config) -> str:
-    """
-    Alternative SerpApi strategy: fetch the page via Google cache in JSON mode,
-    then extract organic result snippets and any embedded product data.
-    Used when html output doesn't contain enough price data.
-    """
-    resp = requests.get(
-        "https://serpapi.com/search",
-        params={
-            "engine":   "google",
-            "q":        f"cache:{url}",
-            "api_key":  cfg.serpapi_key,
-            "gl":       "id",
-            "hl":       "id",
-            "num":      "1",
-        },
-        timeout=30,
+        timeout=cfg.request_timeout,
     )
     resp.raise_for_status()
     data = resp.json()
-
-    # Combine all text fields that might contain price info
-    parts = []
-    for result in data.get("organic_results", []):
-        parts.append(result.get("title", ""))
-        parts.append(result.get("snippet", ""))
-        price_info = result.get("price", "") or result.get("extracted_price", "")
-        if price_info:
-            parts.append(str(price_info))
-    for block in data.get("answer_box", {}).values():
-        if isinstance(block, str):
-            parts.append(block)
-
-    return "\n".join(parts)
-
-
-def _fetch_content(url: str, cfg: Config) -> str:
-    """
-    Try Serper /scrape first, then SerpApi cache.
-    Returns whatever content we get — HTML, markdown, or plain text.
-    The price extractors handle all formats.
-    """
-    errors = []
-
-    if cfg.serper_key:
-        try:
-            content = _fetch_via_serper(url, cfg)
-            if content and len(content) > 200:
-                logger.info("   source: Serper /scrape ✓")
-                return content
-            else:
-                errors.append("Serper returned empty/short content")
-        except Exception as exc:
-            errors.append(f"Serper: {exc}")
-            logger.warning(f"   Serper failed: {exc}")
-
-    if cfg.serpapi_key:
-        try:
-            content = _fetch_via_serpapi_cache(url, cfg)
-            if content and len(content) > 200:
-                logger.info("   source: SerpApi cache ✓")
-                return content
-            else:
-                errors.append("SerpApi cache returned empty content")
-        except Exception as exc:
-            errors.append(f"SerpApi cache: {exc}")
-            logger.warning(f"   SerpApi cache failed: {exc}")
-
-        # Last resort: SerpApi JSON mode
-        try:
-            content = _fetch_via_serpapi_json(url, cfg)
-            if content and len(content) > 50:
-                logger.info("   source: SerpApi JSON ✓")
-                return content
-        except Exception as exc:
-            errors.append(f"SerpApi JSON: {exc}")
-            logger.warning(f"   SerpApi JSON failed: {exc}")
-
-    raise RuntimeError(
-        "All fetch methods failed: " + " | ".join(errors)
-    )
+    return data.get("shopping") or []
 
 
 # ── Retry wrapper ─────────────────────────────────────────────────────────────
@@ -189,170 +114,90 @@ def _with_retry(fn, attempts: int, backoff: float):
     raise last_exc
 
 
-# ── Price extractors ──────────────────────────────────────────────────────────
+# ── Result picking ────────────────────────────────────────────────────────────
 
-def _price_from_next_data(content: str) -> Optional[int]:
-    m = re.search(
-        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-        content, re.DOTALL
-    )
-    if not m:
-        return None
-    try:
-        data = json.loads(m.group(1))
-    except (json.JSONDecodeError, ValueError):
-        return None
-    prices = []
-    _collect_prices(data, prices)
-    return _best_price(prices)
-
-
-def _collect_prices(obj, out: list, depth: int = 0):
-    if depth > 12:
-        return
-    PRICE_KEYS = {
-        "price", "pricemin", "price_min", "saleprice", "pricewithcurrency",
-        "displayprice", "normalprice", "regularprice", "listed", "offer",
-        "amount", "harga", "pricedisplay",
-    }
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k.lower() in PRICE_KEYS:
-                if isinstance(v, (int, float)) and v > 0:
-                    out.append(float(v))
-                elif isinstance(v, str):
-                    cleaned = re.sub(r"[^\d]", "", v)
-                    if cleaned:
-                        out.append(float(cleaned))
-            else:
-                _collect_prices(v, out, depth + 1)
-    elif isinstance(obj, list):
-        for item in obj:
-            _collect_prices(item, out, depth + 1)
-
-
-def _best_price(candidates: list) -> Optional[int]:
-    MIN_IDR, MAX_IDR = 1_000_000, 30_000_000
-    normalised = []
-    for v in candidates:
-        if v > 1_000_000_000:
-            v = v / 100000
-        if MIN_IDR <= v <= MAX_IDR:
-            normalised.append(int(round(v)))
-    if not normalised:
-        return None
-    normalised.sort()
-    return normalised[len(normalised) // 2]
-
-
-def _price_from_json_ld(content: str) -> Optional[int]:
-    for script in re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        content, re.DOTALL
-    ):
-        try:
-            data = json.loads(script)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        items = data if isinstance(data, list) else [data]
-        for item in items:
-            if item.get("@type") in ("Product", "Offer"):
-                offers = item.get("offers") or item
-                if isinstance(offers, list):
-                    offers = offers[0]
-                price_raw = (
-                    offers.get("price") or
-                    offers.get("lowPrice") or
-                    item.get("price")
-                )
-                if price_raw is not None:
-                    try:
-                        price = float(str(price_raw).replace(",", ""))
-                        if 1_000_000 <= price <= 30_000_000:
-                            return int(round(price))
-                    except (ValueError, TypeError):
-                        continue
-    return None
-
-
-def _price_from_og_meta(content: str) -> Optional[int]:
-    m = re.search(
-        r'<meta[^>]+property=["\']og:price:amount["\'][^>]+content=["\']([^"\']+)["\']',
-        content, re.I
-    )
-    if m:
-        try:
-            price = float(re.sub(r"[^\d.]", "", m.group(1)))
-            if 1_000_000 <= price <= 30_000_000:
-                return int(round(price))
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
-def _price_from_text_regex(content: str) -> Optional[int]:
+def _normalise_results(raw: list, source: str) -> list:
     """
-    Works on both HTML and plain text / markdown (Serper often returns markdown).
+    Normalise SerpApi and Serper results to a common shape:
+    [{"title", "source", "price_str", "price", "link", "in_stock"}, ...]
     """
-    try:
-        if "<html" in content.lower() or "<div" in content.lower():
-            soup = BeautifulSoup(content, "lxml")
-            text = soup.get_text(" ", strip=True)
-        else:
-            text = content
-    except Exception:
-        text = content
+    out = []
+    for r in raw:
+        # SerpApi uses "extracted_price"; Serper uses "price" as string
+        price_float = r.get("extracted_price")
+        if price_float is None:
+            price_str = str(r.get("price") or "")
+            digits = re.sub(r"[^\d]", "", price_str)
+            price_float = float(digits) if digits else None
 
-    candidates = []
-    for m in re.finditer(r"Rp\.?\s*([\d]{1,2}(?:[.,]\d{3})+)", text):
-        raw = re.sub(r"[.,]", "", m.group(1))
-        try:
-            v = int(raw)
-            if 1_000_000 <= v <= 30_000_000:
-                candidates.append(v)
-        except ValueError:
+        if price_float is None:
             continue
-    return _best_price([float(c) for c in candidates]) if candidates else None
+
+        # Shopee encodes in micros
+        if price_float > 1_000_000_000:
+            price_float /= 100_000
+
+        if not (1_000_000 <= price_float <= 30_000_000):
+            continue
+
+        out.append({
+            "title":    r.get("title") or "",
+            "source":   r.get("source") or "",
+            "price":    int(round(price_float)),
+            "link":     r.get("link") or r.get("product_link") or "",
+            "in_stock": "out of stock" not in (r.get("title") or "").lower()
+                        and "out of stock" not in (r.get("extensions") or []),
+        })
+    return out
 
 
-# ── Stock / name helpers ──────────────────────────────────────────────────────
+def _best_result(results: list, listing: dict) -> Optional[dict]:
+    """
+    Pick the best result for a listing.
+    Preference order:
+      1. Result whose link contains the exact product URL path
+      2. Result whose link contains the shop slug
+      3. Result whose source field contains the seller name
+      4. First result (already filtered to correct domain by site: operator)
+    """
+    slug        = listing["shop_slug"].lower()
+    seller      = listing["seller"].lower()
+    target_url  = listing["url"]
+    target_path = urlparse(target_url).path.lower()
 
-def _stock_from_content(content: str) -> str:
-    text = content.lower()
-    if any(w in text for w in ["habis", "out of stock", "sold out", "stok habis", "kosong"]):
-        return "out-stock"
-    if any(w in text for w in ["sisa", "limited", "hampir habis", "tersisa"]):
-        return "low-stock"
-    return "in-stock"
+    # Score each result
+    def score(r):
+        link   = r["link"].lower()
+        source = r["source"].lower()
+        if target_path and target_path[:40] in link:
+            return 3
+        if slug in link or slug in source:
+            return 2
+        if seller.replace(" ", "").lower() in source.replace(" ", "").lower():
+            return 1
+        return 0
+
+    scored = sorted(results, key=score, reverse=True)
+    return scored[0] if scored else None
 
 
-def _name_from_content(content: str, fallback: str) -> str:
-    m = re.search(
-        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{5,120})["\']',
-        content, re.I
-    )
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'<title[^>]*>(.*?)</title>', content, re.I | re.DOTALL)
-    if m:
-        name = re.sub(r'\s+', ' ', m.group(1)).strip()
-        if len(name) > 5:
-            return name[:80]
-    # Serper markdown: first H1 heading is usually the product title
-    m = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
-    if m:
-        return m.group(1).strip()[:80]
-    return fallback
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-
-def _classify_variant(name: str) -> str:
-    n = name.lower()
-    if any(w in n for w in ["mario kart", "bundle", "paket", "world", "mk world"]):
+def _classify_variant(title: str) -> str:
+    t = title.lower()
+    if any(w in t for w in ["mario kart", "bundle", "paket", "world", "mk"]):
         return "With Mario Kart"
     return "Standard"
 
 
-def _clean_name(raw: str) -> str:
+def _classify_stock(result: dict) -> str:
+    title = (result.get("title") or "").lower()
+    if any(w in title for w in ["habis", "out of stock", "kosong", "sold out"]):
+        return "out-stock"
+    return "in-stock"
+
+
+def _clean_title(raw: str) -> str:
     name = re.sub(r'\s+', ' ', raw).strip()
     for sep in [' - ', ' | ', ' / ', ',']:
         if len(name) > 70 and sep in name:
@@ -360,47 +205,64 @@ def _clean_name(raw: str) -> str:
     return name[:80]
 
 
-# ── Main per-listing fetcher ──────────────────────────────────────────────────
+# ── Per-listing fetcher ───────────────────────────────────────────────────────
 
 def _fetch_one(listing: dict, cfg: Config) -> dict:
-    url      = listing["url"]
-    platform = listing["platform"]
-    seller   = listing["seller"]
+    query = _build_query(listing)
+    logger.info(f"   query: {query}")
 
-    logger.info(f"   {url}")
+    raw_results = []
+    source_used = "unknown"
 
-    def call():
-        return _fetch_content(url, cfg)
+    # Primary: Serper /shopping (2,500 free/month)
+    if cfg.has_serper():
+        try:
+            def call_serper():
+                return _serper_shopping(query, cfg)
+            raw = _with_retry(call_serper, cfg.retry_attempts, cfg.retry_backoff)
+            raw_results = _normalise_results(raw, "serper")
+            source_used = "serper"
+            logger.info(f"   Serper: {len(raw)} raw → {len(raw_results)} with price")
+        except Exception as exc:
+            logger.warning(f"   Serper failed: {exc}")
 
-    content = _with_retry(call, cfg.retry_attempts, cfg.retry_backoff)
+    # Fallback: SerpApi /search?engine=google_shopping (100 free/month)
+    if not raw_results and cfg.has_serpapi():
+        try:
+            def call_serpapi():
+                return _serpapi_shopping(query, cfg)
+            raw = _with_retry(call_serpapi, cfg.retry_attempts, cfg.retry_backoff)
+            raw_results = _normalise_results(raw, "serpapi")
+            source_used = "serpapi"
+            logger.info(f"   SerpApi: {len(raw)} raw → {len(raw_results)} with price")
+        except Exception as exc:
+            logger.warning(f"   SerpApi failed: {exc}")
 
-    logger.debug(f"   content length: {len(content):,} chars")
+    if not raw_results:
+        raise ValueError("No shopping results with a valid price returned by either API")
 
-    price = (
-        _price_from_next_data(content) or
-        _price_from_json_ld(content)   or
-        _price_from_og_meta(content)   or
-        _price_from_text_regex(content)
+    best = _best_result(raw_results, listing)
+    if not best:
+        raise ValueError("Could not match any result to this seller/listing")
+
+    price   = best["price"]
+    title   = _clean_title(best["title"]) or "Nintendo Switch 2"
+    variant = _classify_variant(title)
+    stock   = _classify_stock(best)
+
+    logger.info(
+        f"   ✓ Rp{price:,}  stock={stock}  variant={variant}  "
+        f"source={source_used}  matched='{best['title'][:50]}'"
     )
 
-    if not price:
-        raise ValueError(
-            f"No price found in {len(content):,} chars of content"
-        )
-
-    stock   = _stock_from_content(content)
-    name    = _clean_name(_name_from_content(content, f"Nintendo Switch 2 — {seller}"))
-    variant = _classify_variant(name)
-
-    logger.info(f"   ✓ Rp{price:,}  {stock}  {variant}")
     return {
-        "seller":   seller,
-        "platform": platform,
-        "product":  name or "Nintendo Switch 2",
+        "seller":   listing["seller"],
+        "platform": listing["platform"],
+        "product":  title,
         "variant":  variant,
         "price":    price,
         "stock":    stock,
-        "url":      url,
+        "url":      listing["url"],   # always use our canonical URL
     }
 
 
@@ -417,13 +279,12 @@ class FetchResult:
 
 
 def fetch_all(cfg: Config) -> FetchResult:
-    result        = FetchResult()
-    result.source = "serper-serpapi"
-    listings      = []
-    fail_count    = 0
+    result     = FetchResult()
+    listings   = []
+    fail_count = 0
 
-    if not cfg.serper_key and not cfg.serpapi_key:
-        logger.warning("No API keys configured — using demo data.")
+    if not cfg.has_any_key():
+        logger.warning("No API keys — using demo data.")
         result.listings = DEMO_LISTINGS
         result.source   = "demo"
         result.success  = True
@@ -441,21 +302,21 @@ def fetch_all(cfg: Config) -> FetchResult:
             fail_count += 1
             logger.error(f"   ✗ {label}: {exc}")
 
+    # Determine dominant source
+    result.source = "serper" if cfg.has_serper() else "serpapi"
+
     total = len(TRACKED_LISTINGS)
-    logger.info(
-        f"\nFetch complete — {len(listings)}/{total} succeeded, "
-        f"{fail_count} failed"
-    )
+    logger.info(f"\nFetch complete — {len(listings)}/{total} OK, {fail_count} failed")
 
     if listings:
         result.listings = listings
         result.success  = True
     else:
-        logger.error("All fetches failed — falling back to demo data.")
+        logger.error("All fetches failed — using demo data.")
         result.listings = DEMO_LISTINGS
         result.source   = "demo"
         result.success  = False
         result.is_demo  = True
-        result.error    = "All fetch attempts returned no price data"
+        result.error    = "All Google Shopping queries returned no usable price data"
 
     return result
