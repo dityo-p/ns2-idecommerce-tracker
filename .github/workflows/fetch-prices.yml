@@ -1,8 +1,12 @@
 name: Fetch prices
 
 on:
+  # Twice a day — 9 AM and 9 PM WIB (02:00 and 14:00 UTC)
+  # 9 listings × 2 runs/day × 30 days = 540 requests/month
+  # Serper free tier: 2,500/month  |  SerpApi free tier: 100/month
+  # → Both are sufficient. Serper is primary; SerpApi is fallback.
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours UTC
+    - cron: "0 2,14 * * *"
 
   workflow_dispatch:
     inputs:
@@ -11,11 +15,7 @@ on:
         required: false
         default: "fetch"
         type: choice
-        options:
-          - fetch
-          - export-only
-          - status
-          - diagnose
+        options: [fetch, export-only, status, diagnose]
 
 jobs:
   fetch-prices:
@@ -39,28 +39,40 @@ jobs:
       - name: Install dependencies
         run: pip install -r engine/requirements.txt
 
-      # ── Restore SQLite DB from cache ──────────────────────────────────────────
+      - name: Check API keys
+        env:
+          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+        run: |
+          echo "=== API key check ==="
+          if [ -n "$SERPER_KEY" ];  then echo "✅ SERPER_KEY set  (${#SERPER_KEY} chars)"; else echo "❌ SERPER_KEY not set"; fi
+          if [ -n "$SERPAPI_KEY" ]; then echo "✅ SERPAPI_KEY set (${#SERPAPI_KEY} chars)"; else echo "❌ SERPAPI_KEY not set"; fi
+          if [ -z "$SERPER_KEY" ] && [ -z "$SERPAPI_KEY" ]; then
+            echo "⚠️  No keys found — will output demo data."
+          fi
+          echo "====================="
+
       - name: Restore DB cache
         uses: actions/cache@v4
         with:
           path: engine/ns2_tracker.db
-          # v2 prefix busts the old cache that had the stale sellers schema.
-          # Increment this prefix whenever a breaking DB schema change is made.
           key: ns2-db-v2-${{ github.run_id }}
           restore-keys: |
             ns2-db-v2-
 
-      # ── Diagnostics ───────────────────────────────────────────────────────────
       - name: Diagnose configuration
         env:
-          DATA_DIR: ${{ github.workspace }}/dashboard/data
+          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          DATA_DIR:    ${{ github.workspace }}/dashboard/data
         working-directory: engine
         run: python main.py --diagnose
 
-      # ── Run engine ────────────────────────────────────────────────────────────
       - name: Run price engine
         env:
-          DATA_DIR: ${{ github.workspace }}/dashboard/data
+          SERPER_KEY:  ${{ secrets.SERPER_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          DATA_DIR:    ${{ github.workspace }}/dashboard/data
         working-directory: engine
         run: |
           MODE="${{ github.event.inputs.mode || 'fetch' }}"
@@ -71,29 +83,21 @@ jobs:
           else python main.py
           fi
 
-      # ── Show exported files ───────────────────────────────────────────────────
       - name: Show exported data
         if: always()
         run: |
-          echo "=== dashboard/data ==="
-          ls -lh dashboard/data/ 2>/dev/null || echo "(no data dir)"
-          echo ""
           echo "=== prices.json ==="
           python3 -c "
-          import json, sys
+          import json
           try:
               d = json.load(open('dashboard/data/prices.json'))
-              print(f'  source : {d.get(\"source\")}')
-              print(f'  is_demo: {d.get(\"is_demo\")}')
-              print(f'  updated: {d.get(\"updated_at\",\"\")[:19]}')
-              print(f'  listings ({len(d.get(\"listings\",[]))}) :')
+              print(f'  source={d.get(\"source\")}  demo={d.get(\"is_demo\")}  listings={len(d.get(\"listings\",[]))}')
               for l in d.get('listings',[]):
                   print(f'    {l[\"seller\"]:<22} {l[\"platform\"]:<12} Rp {l[\"price\"]:>10,}  {l[\"stock\"]}')
           except Exception as e:
-              print(f'  error reading prices.json: {e}')
+              print(f'  error: {e}')
           " 2>/dev/null || true
 
-      # ── Upload engine log ─────────────────────────────────────────────────────
       - name: Upload engine log
         if: always()
         uses: actions/upload-artifact@v4
@@ -102,7 +106,6 @@ jobs:
           path: engine/engine.log
           retention-days: 14
 
-      # ── Commit updated JSON files ─────────────────────────────────────────────
       - name: Commit data files
         if: github.event.inputs.mode != 'status' && github.event.inputs.mode != 'diagnose'
         run: |
@@ -116,5 +119,5 @@ jobs:
           else
             git commit -m "chore: update price data [skip ci]"
             git push
-            echo "✅ Data committed and pushed."
+            echo "✅ Pushed."
           fi
