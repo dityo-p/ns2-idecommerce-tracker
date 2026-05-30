@@ -1,79 +1,31 @@
 {
-  "updated_at": "2026-05-29T00:19:44.462165+00:00",
-  "source": "serpapi",
+  "updated_at": "2026-05-30T11:10:19.952358+00:00",
+  "source": "playwright",
   "is_demo": false,
   "listings": [
     {
-      "seller": "Official Store",
-      "platform": "Tokopedia",
-      "product": "Nintendo Switch 2",
+      "seller": "Supersonicgamestore",
+      "platform": "Shopee",
+      "product": "Nintendo Switch 2 — Supersonicgamestore",
       "variant": "Standard",
-      "price": 1009000,
-      "prev_price": 9499000,
-      "stock": "in-stock",
-      "url": "https://www.tokopedia.com/ps-enterprise-prime-group/nintendo-switch-2-no-sleep-for-kaname-date-from-ai-the-somnium-files-game-english-1732058964635255814",
-      "fetched_at": "2026-05-28T23:57:17.758310",
-      "source": "serpapi"
-    },
-    {
-      "seller": "PS Enterprise",
-      "platform": "Tokopedia",
-      "product": "Nintendo Switch 2",
-      "variant": "Standard",
-      "price": 1055000,
+      "price": 2171805,
       "prev_price": null,
       "stock": "in-stock",
-      "url": "https://www.tokopedia.com/ps-enterprise-prime-group/switch-yu-gi-oh-early-days-collection-1731234385045718022",
-      "fetched_at": "2026-05-28T23:57:17.756344",
-      "source": "serpapi"
+      "url": "https://shopee.co.id/PROMO!-Nintendo-Switch2-Console-Nintendo-Switch-2-Nintendo-2-Switch-2-Switch2-i.12523743.24545210190",
+      "fetched_at": "2026-05-30T11:10:19.942523",
+      "source": "playwright"
     },
     {
       "seller": "Drakuli",
       "platform": "Shopee",
-      "product": "Nintendo Switch 2",
+      "product": "Nintendo Switch 2 — Drakuli",
       "variant": "With Mario Kart",
-      "price": 4749000,
+      "price": 7419885,
       "prev_price": null,
       "stock": "in-stock",
-      "url": "https://shopee.co.id/Nintendo-Switch-2-Console-REG-SG-Asia-Version-NEW-SEGEL-ORIGINAL-MURAH-MERIAH-i.6561199.40168961582",
-      "fetched_at": "2026-05-28T23:57:17.758904",
-      "source": "serpapi"
-    },
-    {
-      "seller": "Official Store",
-      "platform": "Shopee",
-      "product": "Nintendo Switch 2",
-      "variant": "Standard",
-      "price": 6900000,
-      "prev_price": null,
-      "stock": "in-stock",
-      "url": "https://shopee.co.id/Nitendo-Switch-OLED-Pok%C3%A9mon-Scarllet-Full-Games-256GB-i.138465418.22857150889",
-      "fetched_at": "2026-05-28T23:57:17.759462",
-      "source": "serpapi"
-    },
-    {
-      "seller": "Official Store",
-      "platform": "BliBli",
-      "product": "Nintendo Switch 2",
-      "variant": "Standard",
-      "price": 8999000,
-      "prev_price": 8799000,
-      "stock": "in-stock",
-      "url": "https://www.blibli.com/promosi/nintendo-switch-2",
-      "fetched_at": "2026-05-28T23:57:17.759959",
-      "source": "serpapi"
-    },
-    {
-      "seller": "Supersonicgamestore",
-      "platform": "Shopee",
-      "product": "Nintendo Switch 2",
-      "variant": "Standard",
-      "price": 9659000,
-      "prev_price": null,
-      "stock": "in-stock",
-      "url": "https://shopee.co.id/supersonicgamestore",
-      "fetched_at": "2026-05-29T00:19:44.453829",
-      "source": "serpapi"
+      "url": "https://shopee.co.id/Nintendo-Switch-2-Console-Bonus-Game-Mario-Kart-World-Cartridge-Bergaransi-switch-2-i.507067058.27123873650",
+      "fetched_at": "2026-05-30T11:10:19.940606",
+      "source": "playwright"
     }
   ]
 }
