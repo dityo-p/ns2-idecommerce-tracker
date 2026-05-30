@@ -2,8 +2,8 @@ name: Scrape Prices
 
 on:
   schedule:
-    - cron: '0 */12 * * *'   # At minute 0 of every 12th hour (00:00 and 12:00 UTC)
-  workflow_dispatch:          # manual trigger still available
+    - cron: '0 */12 * * *'   # every 12 hours (00:00 and 12:00 UTC)
+  workflow_dispatch:          # allow manual runs
 
 jobs:
   scrape:
@@ -12,7 +12,6 @@ jobs:
       contents: write         # needed to push changes
     steps:
       - uses: actions/checkout@v4
-        with:
 
       - uses: actions/setup-python@v5
         with:
