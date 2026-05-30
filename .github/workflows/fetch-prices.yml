@@ -35,8 +35,15 @@ jobs:
         run: pip install -r engine/requirements.txt
 
       # Install Chromium browser binary — this is what actually runs the pages
+      # Note: --with-deps fails on Ubuntu 24.04 (libasound2 renamed to libasound2t64)
+      # We install the required system libraries manually first, then install without --with-deps
+      - name: Install Playwright system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             libasound2t64             libatk-bridge2.0-0             libatk1.0-0             libcairo2             libcups2             libdbus-1-3             libdrm2             libgbm1             libglib2.0-0             libnspr4             libnss3             libpango-1.0-0             libx11-6             libxcb1             libxcomposite1             libxdamage1             libxext6             libxfixes3             libxkbcommon0             libxrandr2             xvfb
+
       - name: Install Playwright Chromium
-        run: python -m playwright install chromium --with-deps
+        run: python -m playwright install chromium
 
       # ── Restore SQLite DB ─────────────────────────────────────────────────
       - name: Restore DB cache
